@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# sosa: an agent in a box. See `sosa help`.
+exec /usr/bin/python3 -I "$(dirname "$(readlink -f "$0")")/../sosa/cli.py" "$@"

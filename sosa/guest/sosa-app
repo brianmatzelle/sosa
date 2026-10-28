@@ -1,0 +1,365 @@
+#!/usr/bin/env python3
+"""sosa-app: the keeper, inside the box. Builds the app and swaps it in live (blue/green), keeps the last build
+that worked, and brings it back when a new one won't.
+
+    app build              build in the app dir (the stack's `build`); prints the tail of the log, exits with its rc
+    app load [--no-build]  build, start the new build beside the live one on a spare port, wait for the stack's
+                           `health`, point the stable port at it, stop the old one. If it doesn't come up, the live
+                           one stays. Says what happened.
+    app status             what's live (slot, port, unit, since), the last build, health now   (--json)
+    app log [N]            the live instance's journal (last N lines, default 80)
+    app stop               stop the live instance
+    app rollback [REV]     put the app dir back to the last load that stayed up (or REV, from `changes log`), then load
+    app proxy PORT         the stable port: a TCP proxy to whatever instance is live (sosa-app-proxy@.service)
+    app resume             at boot (sosa-app-resume.service): start the slot that was live again, no build
+
+Config: /etc/sosa/app.json, written from the stack's [app] table: dir, build, run, health, ports, ready_s, env.
+`run` must stay in the foreground and listen on $PORT (a spare port, not the stable one); `health` gets $PORT too
+and exits 0 when the instance is up. The first port in `ports` is the stable one; the rest are passed straight
+through to the app. State in /var/lib/sosa/app: live.json, build.log, good (the changes rev of the last load that
+stayed up). Needs root (systemd); the agent user may run it through sudo (sudoers, cloud-init).
+"""
+import json
+import os
+import pwd
+import socket
+import subprocess
+import sys
+import threading
+import time
+
+CONF = "/etc/sosa/app.json"
+STATE = "/var/lib/sosa/app"
+LIVE = os.path.join(STATE, "live.json")
+GOOD = os.path.join(STATE, "good")
+BUILD_LOG = os.path.join(STATE, "build.log")
+SLOT_BASE = 10000                       # instance ports: stable + 10000 + slot
+AGENT = os.environ.get("SOSA_USER") or "sosa"
+
+
+def die(msg, rc=1):
+    print(f"app: {msg}", file=sys.stderr)
+    sys.exit(rc)
+
+
+def conf():
+    try:
+        with open(CONF) as f:
+            c = json.load(f)
+    except OSError as e:
+        die(f"no {CONF} ({e}): this box has no app table in its stack")
+    for k in ("dir", "run", "ports"):
+        if not c.get(k):
+            die(f"{CONF} lacks {k}")
+    return c
+
+
+def read_live():
+    try:
+        with open(LIVE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def write_live(obj):
+    os.makedirs(STATE, exist_ok=True)
+    tmp = LIVE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(obj, f)
+    os.replace(tmp, LIVE)
+
+
+STACK = "/opt/sosa/stack"
+
+
+def cmd_for(line):
+    """A stack command line: `tools/x ...` means the stack's tools dir, wherever the command runs."""
+    line = str(line).strip()
+    if line.startswith("tools/"):
+        line = os.path.join(STACK, line)
+    return line
+
+
+def env_for(c, port):
+    pw = pwd.getpwnam(AGENT)
+    e = {"PATH": "/opt/sosa/stack/tools:/opt/sosa/bin:/usr/local/bin:/usr/bin:/bin", "HOME": pw.pw_dir,
+         "USER": AGENT, "LOGNAME": AGENT, "LANG": "C.UTF-8", "TERM": "dumb", "PORT": str(port),
+         "APP_DIR": c["dir"], "STABLE_PORT": str(c["ports"][0])}
+    try:
+        for line in open("/etc/sosa/env"):
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, _, v = line.partition("=")
+                e[k.strip()] = v.strip()
+    except OSError:
+        pass
+    e.update({str(k): str(v) for k, v in (c.get("env") or {}).items()})
+    return e
+
+
+def as_agent():
+    pw = pwd.getpwnam(AGENT)
+    return dict(user=pw.pw_uid, group=pw.pw_gid, extra_groups=[])
+
+
+def unit(slot):
+    return f"sosa-app@{slot}.service"
+
+
+def active(u):
+    return subprocess.run(["systemctl", "is-active", "--quiet", u]).returncode == 0
+
+
+def build(c):
+    if not c.get("build"):
+        print("no build step in the stack")
+        return 0
+    os.makedirs(STATE, exist_ok=True)
+    print(f"building in {c['dir']}: {c['build']}")
+    t0 = time.time()
+    with open(BUILD_LOG, "wb") as log:
+        p = subprocess.run(["bash", "-c", cmd_for(c["build"])], cwd=c["dir"], env=env_for(c, c["ports"][0]),
+                           stdout=log, stderr=subprocess.STDOUT, **as_agent())
+    tail = subprocess.run(["tail", "-n", "30", BUILD_LOG], capture_output=True, text=True).stdout
+    print(tail.rstrip())
+    print(f"build {'ok' if p.returncode == 0 else f'failed (rc {p.returncode})'} in {time.time() - t0:.0f} s"
+          f"{'' if p.returncode == 0 else f'; the whole log: {BUILD_LOG}'}")
+    return p.returncode
+
+
+def healthy(c, port, timeout=5):
+    if not c.get("health"):
+        try:
+            socket.create_connection(("127.0.0.1", port), timeout=timeout).close()
+            return True
+        except OSError:
+            return False
+    try:
+        p = subprocess.run(["bash", "-c", cmd_for(c["health"])], cwd=c["dir"], env=env_for(c, port), capture_output=True,
+                           timeout=timeout, **as_agent())
+        return p.returncode == 0
+    except subprocess.TimeoutExpired:
+        return False
+
+
+def start(c, slot):
+    port = c["ports"][0] + SLOT_BASE + slot
+    u = unit(slot)
+    subprocess.run(["systemctl", "stop", u], capture_output=True)
+    subprocess.run(["systemctl", "reset-failed", u], capture_output=True)
+    env = env_for(c, port)
+    cmd = ["systemd-run", "--quiet", "--unit", u[:-8], "--uid", AGENT, "-p", f"WorkingDirectory={c['dir']}",
+           "-p", "KillMode=mixed", "-p", "TimeoutStopSec=30", "--collect"]
+    for k, v in env.items():
+        cmd += ["-E", f"{k}={v}"]
+    cmd += ["bash", "-c", cmd_for(c["run"])]
+    p = subprocess.run(cmd, capture_output=True, text=True)
+    if p.returncode != 0:
+        die(f"couldn't start {u}: {p.stderr.strip()}")
+    return port
+
+
+def changes_rev():
+    p = subprocess.run(["/opt/sosa/bin/changes", "rev-parse", "--short", "HEAD"], capture_output=True, text=True)
+    return p.stdout.strip() if p.returncode == 0 else ""
+
+
+def load(c, do_build=True):
+    if do_build and build(c) != 0:
+        print("not loaded: the build failed; the live app stays as it was")
+        return 2
+    # what's loaded is always a commit, so `app rollback` has it
+    subprocess.run(["/opt/sosa/bin/changes", "snapshot", "app load " + time.strftime("%F %H:%M")], capture_output=True,
+                   cwd="/", **as_agent())
+    live = read_live() or {}
+    old = live.get("slot")
+    slot = 1 if old == 0 else 0
+    port = start(c, slot)
+    print(f"starting slot {slot} on port {port} ({unit(slot)}), waiting up to {c.get('ready_s', 60)} s for health")
+    t0 = time.time()
+    up = False
+    while time.time() - t0 < float(c.get("ready_s", 60)):
+        if not active(unit(slot)):
+            break
+        if healthy(c, port):
+            up = True
+            break
+        time.sleep(1)
+    if not up:
+        j = subprocess.run(["journalctl", "-u", unit(slot), "-n", "30", "--no-pager", "-o", "cat"],
+                           capture_output=True, text=True).stdout
+        subprocess.run(["systemctl", "stop", unit(slot)], capture_output=True)
+        print(j.rstrip())
+        print(f"not loaded: slot {slot} {'exited' if not active(unit(slot)) else 'never answered health'} "
+              f"within {c.get('ready_s', 60)} s; " + (f"slot {old} stays live" if old is not None else "nothing is live"))
+        return 3
+    write_live({"slot": slot, "port": port, "unit": unit(slot), "since": time.strftime("%FT%T"),
+                "rev": changes_rev()})
+    if old is not None and old != slot:
+        subprocess.run(["systemctl", "stop", unit(old)], capture_output=True)
+    # the stable port's proxy follows live.json; make sure it's up
+    subprocess.run(["systemctl", "start", f"sosa-app-proxy@{c['ports'][0]}.service"], capture_output=True)
+    # remember this as the last load that worked once it has stayed up a little
+    threading.Thread(target=mark_good, args=(c, slot, port), daemon=False).start()
+    print(f"live: slot {slot} on port {port}, behind the stable port {c['ports'][0]} (took {time.time() - t0:.0f} s)")
+    return 0
+
+
+def mark_good(c, slot, port, after=15):
+    time.sleep(after)
+    live = read_live() or {}
+    if live.get("slot") == slot and active(unit(slot)) and healthy(c, port):
+        rev = live.get("rev") or changes_rev()
+        if rev:
+            os.makedirs(STATE, exist_ok=True)
+            with open(GOOD, "w") as f:
+                f.write(rev + "\n")
+
+
+def resume(c):
+    """After a reboot: the instance that was live is gone with its transient unit; start it again as it was."""
+    live = read_live()
+    if not live:
+        print("nothing was live")
+        return 0
+    slot = live["slot"]
+    if active(unit(slot)):
+        print(f"slot {slot} is already running")
+        return 0
+    port = start(c, slot)
+    t0 = time.time()
+    while time.time() - t0 < float(c.get("ready_s", 60)):
+        if not active(unit(slot)):
+            break
+        if healthy(c, port):
+            write_live({**live, "port": port, "unit": unit(slot), "resumed": time.strftime("%FT%T")})
+            subprocess.run(["systemctl", "start", f"sosa-app-proxy@{c['ports'][0]}.service"], capture_output=True)
+            print(f"resumed: slot {slot} on port {port} ({time.time() - t0:.0f} s)")
+            return 0
+        time.sleep(1)
+    print(f"slot {slot} didn't come back within {c.get('ready_s', 60)} s (app log, app load)")
+    return 3
+
+
+def status(c, as_json=False):
+    live = read_live()
+    st = {"live": live, "stable_port": c["ports"][0], "ports": c["ports"], "dir": c["dir"]}
+    if live:
+        st["unit_active"] = active(live["unit"])
+        st["healthy"] = healthy(c, live["port"])
+    try:
+        st["good"] = open(GOOD).read().strip()
+    except OSError:
+        st["good"] = None
+    try:
+        st["build_log_tail"] = subprocess.run(["tail", "-n", "5", BUILD_LOG], capture_output=True, text=True).stdout
+    except OSError:
+        pass
+    if as_json:
+        print(json.dumps(st))
+        return
+    if not live:
+        print(f"nothing is live (app load). stable port {c['ports'][0]}, app dir {c['dir']}")
+        return
+    print(f"live: slot {live['slot']} on port {live['port']} since {live['since']} ({live['unit']} "
+          f"{'active' if st['unit_active'] else 'NOT active'}, health {'ok' if st['healthy'] else 'FAILING'}), "
+          f"behind stable port {c['ports'][0]}; last good rev {st['good'] or 'none'}")
+
+
+def proxy(port):
+    """The stable port: each connection goes to whatever live.json says now."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(("0.0.0.0", port))
+    s.listen(128)
+    print(f"stable port {port}: proxying to the live instance ({LIVE})", flush=True)
+
+    def pump(a, b):
+        try:
+            while True:
+                d = a.recv(65536)
+                if not d:
+                    break
+                b.sendall(d)
+        except OSError:
+            pass
+        finally:
+            try:
+                b.shutdown(socket.SHUT_WR)
+            except OSError:
+                pass
+
+    def handle(c):
+        live = read_live()
+        if not live:
+            c.sendall(b"HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n"
+                      b"nothing is live yet (app load)\n")
+            return c.close()
+        try:
+            t = socket.create_connection(("127.0.0.1", live["port"]), timeout=5)
+        except OSError as e:
+            c.sendall(f"HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n"
+                      f"the live instance on {live['port']} isn't answering: {e}\n".encode())
+            return c.close()
+        th = threading.Thread(target=pump, args=(t, c), daemon=True)
+        th.start()
+        pump(c, t)
+        th.join()
+        c.close()
+        t.close()
+
+    while True:
+        c, _ = s.accept()
+        threading.Thread(target=handle, args=(c,), daemon=True).start()
+
+
+def main(argv):
+    cmd = argv[0] if argv else "help"
+    if cmd in ("help", "-h", "--help"):
+        print(__doc__.strip())
+        return 0
+    if os.geteuid() != 0:
+        os.execvp("sudo", ["sudo", "-n", os.path.abspath(__file__)] + argv)
+    c = conf()
+    if cmd == "build":
+        return build(c)
+    if cmd == "load":
+        return load(c, do_build="--no-build" not in argv)
+    if cmd == "status":
+        return status(c, "--json" in argv)
+    if cmd == "log":
+        live = read_live()
+        if not live:
+            die("nothing is live")
+        n = next((a for a in argv[1:] if a.isdigit()), "80")
+        return subprocess.run(["journalctl", "-u", live["unit"], "-n", n, "--no-pager", "-o", "short-iso"]).returncode
+    if cmd == "stop":
+        live = read_live()
+        if live:
+            subprocess.run(["systemctl", "stop", live["unit"]])
+            os.unlink(LIVE)
+            print(f"stopped slot {live['slot']}")
+        return 0
+    if cmd == "rollback":
+        rev = argv[1] if len(argv) > 1 else (open(GOOD).read().strip() if os.path.exists(GOOD) else "")
+        if not rev:
+            die("no last-good rev yet (a load has to stay up 15 s first); `app rollback REV` with one from `changes log`")
+        rel = c["dir"].lstrip("/")
+        print(f"restoring {c['dir']} to {rev}")
+        p = subprocess.run(["/opt/sosa/bin/changes", "restore", "-s", rev, "--", rel], cwd="/", capture_output=True,
+                           text=True)
+        if p.returncode != 0:
+            die(f"changes restore failed: {p.stderr.strip()}")
+        subprocess.run(["chown", "-R", f"{AGENT}:{AGENT}", c["dir"]])
+        subprocess.run(["/opt/sosa/bin/changes", "snapshot", f"rollback to {rev}"], **as_agent())
+        return load(c)
+    if cmd == "proxy":
+        return proxy(int(argv[1]))
+    if cmd == "resume":
+        return resume(c)
+    die(f"unknown command {cmd!r} (app help)")
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]) or 0)

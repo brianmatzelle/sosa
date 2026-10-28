@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# changes: the history of what was changed on this machine (by the agent, and by people through it), in git.
+#
+#   changes snapshot <message>   # commit what changed in the tracked paths, if anything (the harness runs it after every turn)
+#   changes paths                # what's tracked: /srv/changes.paths, one path from / per line; add what you make elsewhere
+#   changes <git command ...>    # any git command on the history: log --stat, show, diff HEAD~3, restore -s <rev> -- <path>
+#
+# The repo is /srv/changes.git, its work tree is /, and only the paths in /srv/changes.paths go in: the stack's list
+# (its changes.paths) plus sosa's own (the agent's CLAUDE.md and memory, /usr/local/bin, systemd units). Build output,
+# logs and any file over 5 MB are left out. The app dir is tracked whole; data that changes every second (a database)
+# belongs outside it, or in the excludes below. A file root owns needs sudo to restore: sudo changes restore ...
+set -euo pipefail
+GD=${CHANGES_GIT:-/srv/changes.git} PATHS=${CHANGES_PATHS:-/srv/changes.paths}
+AGENT=${SOSA_USER:-sosa}
+g() { git -c safe.directory='*' --git-dir="$GD" --work-tree=/ "$@"; }
+# as root (sudo changes ...), give the repo back to the agent after, or its next snapshot can't write to it
+if (( EUID == 0 )); then trap 'chown -R "$AGENT:$AGENT" "$GD" 2>/dev/null || true' EXIT; fi
+
+init() {
+  [[ -d $GD ]] && return
+  install -d -o "$AGENT" -g "$AGENT" "$GD" 2>/dev/null || mkdir -p "$GD"
+  git init -q --bare "$GD"
+  g config core.bare false
+  g config status.showUntrackedFiles no  # the work tree is /: only what's tracked
+  g config user.name "$AGENT"
+  g config user.email "$AGENT@localhost"
+  if [[ ! -f $PATHS ]]; then
+    install -o "$AGENT" -g "$AGENT" -m 644 /dev/null "$PATHS" 2>/dev/null || : > "$PATHS"
+    {
+      [[ -f /opt/sosa/stack/changes.paths ]] && grep -v '^\s*#' /opt/sosa/stack/changes.paths
+      printf '%s\n' "home/$AGENT/.claude/CLAUDE.md" "home/$AGENT/.claude/projects" usr/local/bin etc/systemd/system etc/sosa/env
+    } | sed 's|^/||' | awk 'NF && !seen[$0]++' > "$PATHS"
+  fi
+}
+
+snapshot() {
+  local msg=${1:-snapshot} specs=() p big
+  init
+  cd /  # git reads a pathspec from where it runs, and the tracked paths are from /
+  # what never goes in, rewritten each time so a change here reaches an existing history
+  {
+    printf '%s\n' '*.jar' '*.class' 'build/' 'target/' 'node_modules/' 'dist/' '.gradle/' '*.log' '*.gz' '*.zip' \
+      '*.lock' '__pycache__/' 'tmp/' '*.tmp' '*.so' '*.o' '*.pyc' '.venv/' '*.db' '*.sqlite' '*.sqlite3'
+    [[ -f /opt/sosa/stack/changes.exclude ]] && grep -v '^\s*#' /opt/sosa/stack/changes.exclude
+  } > "$GD/info/exclude"
+  while read -r p; do
+    p=${p#/}
+    [[ -z $p || $p == \#* ]] && continue
+    # a path that's gone still counts if it was tracked (a deleted file); one that never was would stop git add
+    if [[ -e /$p || -L /$p || -n $(g ls-files -- "$p" | head -1) ]]; then specs+=("$p"); fi
+  done < "$PATHS"
+  ((${#specs[@]})) || return 0
+  g add -A -- "${specs[@]}" 2>/dev/null || g add -A --ignore-errors -- "${specs[@]}"
+  # and out with what's tracked from before an exclude was added
+  g ls-files -z -c -i --exclude-from="$GD/info/exclude" -- "${specs[@]}" | xargs -0 -r git -c safe.directory='*' \
+    --git-dir="$GD" --work-tree=/ rm -q --cached --
+  # files over 5 MB: out
+  while IFS= read -r -d '' big; do g rm -q --cached -- "$big"; done < <(g diff --cached --name-only -z --diff-filter=AM | while IFS= read -r -d '' f; do [[ -f /$f && $(stat -c %s "/$f") -gt 5242880 ]] && printf '%s\0' "$f"; done)
+  g diff --cached --quiet && return 0
+  g commit -q -m "$msg"
+  g log -1 --format='%h %s (%ar)'
+}
+
+case ${1:-} in
+  snapshot) shift; snapshot "${1:-snapshot}" ;;
+  paths) init; cat "$PATHS" ;;
+  ""|-h|--help|help) sed -n '2,12p' "$0" ;;
+  *) init; g "$@" ;;
+esac

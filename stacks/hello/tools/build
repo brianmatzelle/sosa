@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# build: the hello app has nothing to compile; check that it parses.
+set -euo pipefail
+cd "${APP_DIR:-/srv/app}"
+python3 -I -m py_compile app.py && echo "app.py parses"

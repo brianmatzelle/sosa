@@ -1,0 +1,152 @@
+#cloud-config
+# A sosa box, rendered by `sosa create` (and `sosa image` for a bake). A stock Ubuntu cloud image with no network
+# interface at all: the only ways in or out are cloud-hypervisor's vsock (sosa/guest/fwd.py).
+#   host -> guest port 5000   sosa-mind.service: mind.py (turns, health, token, exec, put)
+#   host -> guest port 5001   sosa-fwd.service: the preview path to the app's ports
+#   guest -> host port 3128   the egress proxy (what the stack allows, by hostname)
+#   guest -> host port 8097   the relay (Claude, with the key on the host)
+# There is no apt, so what isn't in the image comes on the payload disk (LABEL=sosaload, made by create):
+# Claude Code, sosa's guest programs, the stack. cloud-init runs once; after that, `sosa push` / `exec` over vsock.
+hostname: __HOSTNAME__
+timezone: __TZ__
+package_update: false
+package_upgrade: false
+ssh_pwauth: false
+disable_root: true
+
+users:
+  # the agent is an ordinary user; whether it has sudo is the stack's call (agent.sudo). Its home is its memory.
+  # root's mind.py starts each of its turns as it.
+  - name: __USER__
+    gecos: the agent
+    shell: /bin/bash
+    homedir: /home/__USER__
+    groups: [systemd-journal]
+    lock_passwd: true
+__SUDO_LINE__
+
+write_files:
+  # vsock from the guest to itself (CID 1) would let the agent reach the mind's root `exec` from inside.
+  # mind.py also refuses any peer but the host (CID 2).
+  - path: /etc/modprobe.d/sosa-vsock.conf
+    content: |
+      install vsock_loopback /bin/false
+
+  # the keeper may always be run through sudo (it needs systemd); full sudo is __SUDO_LINE__ above
+  - path: /etc/sudoers.d/sosa-app
+    permissions: "0440"
+    content: |
+      __USER__ ALL=(root) NOPASSWD: /opt/sosa/bin/sosa-app
+
+  - path: /etc/systemd/system/sosa-mind.service
+    content: |
+      [Unit]
+      Description=the agent's mind: claude -p turns over vsock port 5000 (mind.py)
+      OnFailure=sosa-mind-rollback.service
+      StartLimitIntervalSec=120
+      StartLimitBurst=5
+
+      [Service]
+      ExecStartPre=-/usr/sbin/modprobe vmw_vsock_virtio_transport
+      ExecStart=/usr/bin/python3 -I /opt/sosa/bin/mind.py serve --guest --listen vsock:5000 --home /home/__USER__ --cwd __CWD__ --user __USER__ --state /var/lib/sosa --token-file /etc/sosa/token --proxy http://127.0.0.1:3128 --claude /usr/local/bin/claude --timeout __TIMEOUT__
+      Restart=always
+      RestartSec=3
+
+      [Install]
+      WantedBy=multi-user.target
+
+  # `sosa push` keeps the last good mind.py as mind.py.prev; if a new one can't stay up, this puts the old one
+  # back, since the mind is the only way in. OnFailure= fires on every failure (Restart=always passes through
+  # "failed"), so it only rolls back on the third in a row since the last manual (re)start.
+  - path: /usr/local/lib/sosa/mind-rollback
+    permissions: "0755"
+    content: |
+      #!/bin/sh
+      n=$(systemctl show -P NRestarts sosa-mind.service)
+      if [ "${n:-0}" -ge 2 ] && [ -f /opt/sosa/bin/mind.py.prev ]; then
+        mv -f /opt/sosa/bin/mind.py /opt/sosa/bin/mind.py.bad
+        mv -f /opt/sosa/bin/mind.py.prev /opt/sosa/bin/mind.py
+        echo "sosa-mind failed $((n + 1)) times in a row: rolled back to the previous mind.py (the failing one is mind.py.bad)"
+      fi
+      if [ "$(systemctl show -P ActiveState sosa-mind.service)" = failed ]; then
+        systemctl reset-failed sosa-mind.service
+        systemctl start --no-block sosa-mind.service
+      fi
+
+  - path: /etc/systemd/system/sosa-mind-rollback.service
+    content: |
+      [Unit]
+      Description=Put the previous mind.py back when sosa-mind keeps failing
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/lib/sosa/mind-rollback
+
+  - path: /etc/systemd/system/sosa-fwd.service
+    content: |
+      [Unit]
+      Description=the box's openings: egress and relay out, preview in, all over vsock
+
+      [Service]
+      ExecStartPre=+-/usr/sbin/modprobe vmw_vsock_virtio_transport
+      ExecStart=/usr/bin/python3 -I /opt/sosa/bin/fwd.py
+      DynamicUser=yes
+      Restart=always
+      RestartSec=2
+
+      [Install]
+      WantedBy=multi-user.target
+
+  - path: /etc/systemd/system/sosa-app-proxy@.service
+    content: |
+      [Unit]
+      Description=the app's stable port %i, proxied to the live instance (sosa-app)
+
+      [Service]
+      ExecStart=/usr/bin/python3 -I /opt/sosa/bin/sosa-app proxy %i
+      Restart=always
+      RestartSec=2
+
+      [Install]
+      WantedBy=multi-user.target
+
+  - path: /etc/systemd/system/sosa-app-resume.service
+    content: |
+      [Unit]
+      Description=bring the app's live instance back after a boot (sosa-app resume)
+      After=multi-user.target
+      ConditionPathExists=/etc/sosa/app.json
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/bin/python3 -I /opt/sosa/bin/sosa-app resume
+
+      [Install]
+      WantedBy=multi-user.target
+
+  - path: /etc/profile.d/sosa.sh
+    content: |
+      export PATH=/opt/sosa/stack/tools:/opt/sosa/bin:$PATH
+      [ -f /etc/sosa/env ] && set -a && . /etc/sosa/env && set +a
+
+runcmd:
+  - mkdir -p /mnt/sosaload /opt/sosa/bin /opt/sosa/stack /etc/sosa /var/lib/sosa /run/sosa /srv
+  - chmod 0755 /etc/sosa
+  - chmod 0700 /var/lib/sosa
+  - chmod 0755 /run/sosa
+  - mount -o ro LABEL=sosaload /mnt/sosaload
+  - install -m 0755 /mnt/sosaload/claude /usr/local/bin/claude
+  - install -m 0755 /mnt/sosaload/bin/* /opt/sosa/bin/
+  - ln -sf /opt/sosa/bin/sosa-app /opt/sosa/bin/app
+  - [sh, -c, 'if [ -d /mnt/sosaload/stack ]; then cp -a /mnt/sosaload/stack/. /opt/sosa/stack/; chmod -R a+rX /opt/sosa/stack; fi']
+  - [sh, -c, 'for f in env ports app.json; do [ -f /mnt/sosaload/etc/$f ] && install -m 0644 /mnt/sosaload/etc/$f /etc/sosa/$f; done; true']
+  - [sh, -c, 'if [ -d /mnt/sosaload/home ]; then cp -a /mnt/sosaload/home/. /home/__USER__/; fi; chown -R __USER__:__USER__ /home/__USER__']
+  - [sh, -c, 'if [ -d /mnt/sosaload/stack/seed ] && [ ! -e __APP_DIR__ ]; then mkdir -p "$(dirname __APP_DIR__)" && cp -a /mnt/sosaload/stack/seed __APP_DIR__ && chown -R __USER__:__USER__ __APP_DIR__; fi']
+  - [sh, -c, 'mkdir -p /srv && chown __USER__:__USER__ /srv']
+  - umount /mnt/sosaload
+  - [sh, -c, 'cd / && runuser -u __USER__ -- /opt/sosa/bin/changes snapshot "the box, as it was" || true']
+  - systemctl daemon-reload
+  - systemctl enable --now sosa-fwd.service sosa-mind.service
+  - [sh, -c, 'if [ -f /etc/sosa/app.json ]; then p=$(python3 -c "import json;print(json.load(open(\"/etc/sosa/app.json\"))[\"ports\"][0])"); systemctl enable --now sosa-app-proxy@$p.service; systemctl enable sosa-app-resume.service; fi']
+
+final_message: "sosa box __HOSTNAME__ is up after $UPTIME seconds"

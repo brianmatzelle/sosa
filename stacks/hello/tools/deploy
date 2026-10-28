@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# deploy: a privileged tool, as an example of the gate. The harness writes /run/sosa/turn.json (root-owned) before
+# every turn; a tool that is the owner's call reads the role there, never from the conversation.
+set -euo pipefail
+role=$(python3 -c 'import json; print(json.load(open("/run/sosa/turn.json")).get("role", ""))' 2>/dev/null || echo "")
+if [[ $role != owner ]]; then
+  echo "deploy: refused: this is the owner's call (the turn is from role '${role:-unknown}')" >&2
+  exit 77
+fi
+echo "deploy: would deploy /srv/app now (this example only prints). The owner asked, so it's allowed."

@@ -1,0 +1,33 @@
+name = "hello"
+description = "the smallest stack that passes the contract: a stdlib Python web app, no bake"
+
+[box]
+mem = "2G"
+cpus = 2
+disk = "8G"
+
+[agent]
+user = "sosa"
+sudo = true
+cwd = "/srv/app"
+model = "claude-sonnet-5-5"
+max_turns = 50
+timeout_s = 900
+memory = true
+
+[app]
+dir = "/srv/app"
+build = "tools/build"
+run = "python3 -I app.py"
+health = "tools/health"
+ports = [8080]
+ready_s = 30
+
+[egress]
+allow = []
+
+[env]
+APP_NAME = "hello"
+
+[gate]
+privileged = ["deploy"]

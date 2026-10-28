@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# health: exit 0 when the instance on $PORT answers GET /health with 200.
+curl -fsS --max-time 3 "http://127.0.0.1:${PORT:?}/health" >/dev/null
