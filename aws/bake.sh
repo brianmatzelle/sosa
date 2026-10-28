@@ -22,9 +22,10 @@ for d in "$H"/.sosa/stacks/*/; do
   step "the image for stack $s"
   as_u "sosa image $s" | tail -3 | sed 's/^/   /'
 done
-as_u "sosa images" | sed 's/^/   /'
+images=$(as_u "sosa images"); printf '%s\n' "$images" | sed 's/^/   /'
 
 step "this host out of it"
+# (nothing runs sosa past this point: with its socket gone the CLI would start a daemon again)
 as_u "systemctl --user stop sosad" || true
 systemctl stop sosa-host-idle.timer 2>/dev/null || true
 rm -rf "$H"/.sosa/boxes/* "$H"/.sosa/dl
@@ -33,7 +34,7 @@ rm -rf "$H"/.bash_history "$H"/.claude/projects "$H"/.claude/history.jsonl "$H"/
 rm -rf /root/.bash_history /var/lib/sosa
 rm -f /etc/sosa/aws.env
 echo "sosa host image: repo $(git -c safe.directory='*' -C "$REPO" rev-parse --short HEAD), $(date -u +%FT%TZ)" > /etc/sosa/image
-as_u "sosa images" >> /etc/sosa/image
+printf '%s\n' "$images" >> /etc/sosa/image
 status "baked: powering off for the snapshot"
 apt-get clean
 journalctl --rotate >/dev/null 2>&1 || true

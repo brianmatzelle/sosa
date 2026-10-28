@@ -202,7 +202,7 @@ Resources:
               fi
               READY_STATUS="bootstrapped" $REPO/aws/bootstrap.sh
               if [ "${Mode}" = bake ]; then
-                $REPO/aws/bake.sh
+                $REPO/aws/bake.sh || exit 1   # its own trap has said where it failed
                 exit 0
               fi
               status "ready"
