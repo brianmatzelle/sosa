@@ -1,5 +1,7 @@
 # sosa
 
+super.open.source.agent
+
 An agent in a box.
 
 A **box** is a small virtual machine with no network interface. In it lives one agent: Claude Code, with a shell,
