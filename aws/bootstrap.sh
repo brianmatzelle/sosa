@@ -121,6 +121,12 @@ as_u "systemctl --user enable -q sosad && systemctl --user restart sosad"
 for _ in $(seq 1 30); do [[ -S $H/.sosa/sosad.sock ]] && break; sleep 1; done
 as_u "sosa --json stack list >/dev/null && sosa stack list"
 
+if [[ -f /etc/sosa/image ]]; then
+  step "warming the baked images (a volume from a snapshot reads each block from S3 once: ~10 MB/s the first time)"
+  # in the background: the first box's copy of a 2 GB image would otherwise take minutes
+  systemd-run --quiet --unit sosa-warm --collect bash -c "cat $H/.sosa/images/*.raw > /dev/null" || true
+fi
+
 step "host idle stop (aws/host-idle.py, every minute; IDLE_MINUTES=$IDLE_MINUTES)"
 install -d -m 755 /var/lib/sosa
 cat > /etc/systemd/system/sosa-host-idle.service <<EOF

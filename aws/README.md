@@ -51,7 +51,9 @@ their own; once every box on a host is asleep for `IdleMinutes`, the host stops.
 starts it again: the front door runs `wake.sh`, waits for the daemon, wakes the box, and serves. From a stopped
 instance that is about a minute.
 
-A stack's image is baked into the host image, so a new box from it starts in seconds. A new stack, or a changed
+A stack's image is baked into the host image, so a new box from it starts in seconds (the host reads the baked
+images through once right after boot, in the background: a volume from a snapshot fetches each block from S3 the
+first time, and a box created before that finishes copies its image at that speed, minutes for 2 GB). A new stack, or a changed
 one: `aws/sosa-aws stacks DIR` then `aws/sosa-aws image` for the next hosts, and on a running host
 `aws/sosa-aws run host-1 -- 'sudo aws/bootstrap.sh && sosa image STACK'`.
 
