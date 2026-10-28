@@ -28,10 +28,16 @@ On http://ZONE/ itself (or the front door by address, for the /_sosa/ paths), it
                                           the fewest boxes running (the answer carries "host")
   ANY  /_sosa/hosts/HOST/v1/...           any daemon route, on that host
 
+Hosts can sleep too. A host that announced a wake handle (its <home>/wake, e.g. aws:us-east-2:i-0123...) and
+then stops answering is started on the next request for one of its boxes, or the next API call to it: the front
+door runs `wake_cmd <handle>` (aws/wake.sh starts the instance and waits for it), then waits for the daemon.
+Hosts on AWS stop themselves when every box has been asleep for a while (aws/host-idle.py).
+
 Config, <home>/front.json (every key optional; flags override):
   {"listen": "127.0.0.1:8180", "zone": "localhost",
    "hosts": [{"name": "aws-1", "url": "http://10.0.0.5:8790", "token_file": "/home/me/.sosa/aws-1.token"}],
-   "secret_file": "/home/me/.sosa/front-secret"}
+   "secret_file": "/home/me/.sosa/front-secret",
+   "wake_cmd": "/home/me/sosa/aws/wake.sh"}
 With no hosts and none registered, the local daemon. With a secret_file, every request must carry
 `X-Sosa-Front: <the secret>`: that's how you put your own login (SSO, a cookie, anything) in front of it: your
 proxy checks the person, sets the header, and whatever it says in X-Sosa-User is passed on to the box's app;
@@ -45,6 +51,7 @@ import re
 import secrets as secretsmod
 import socket
 import socketserver
+import subprocess
 import sys
 import threading
 import time
@@ -161,7 +168,13 @@ class Host:
             self.boxes = {b["name"]: b for b in body.get("boxes") or [] if isinstance(b, dict) and b.get("name") and not b.get("bake")}
             self.fetched = time.time()
             self.seen = time.time()
-            self.info = {k: body.get(k) for k in ("stacks", "images", "running", "mem_free_mb", "cpus", "pid")}
+            self.info = {k: body.get(k) for k in ("stacks", "images", "running", "mem_free_mb", "cpus", "pid", "wake")}
+
+    def alive(self, timeout=5):
+        try:
+            return bool(self.request("GET", "/v1/health", timeout=timeout).get("ok"))
+        except (OSError, ValueError):
+            return False
 
     def stale(self):
         return self.registered and time.time() - self.seen > STALE
@@ -211,8 +224,35 @@ class Front:
         self.implicit = not self.fixed and not self.dynamic
         if self.implicit:                      # nothing configured, nobody registered: the daemon on this machine
             self.fixed = [Host({"name": "local", "url": f"unix://{home}/sosad.sock"}, log)]
+        self.wake_cmd = cfg.get("wake_cmd")
         self.wake_locks = {}
         self.mu = threading.Lock()
+
+    def ensure_host(self, host):
+        """The host's daemon answers, or (with a wake handle and a wake_cmd) is started. Raises OSError."""
+        if host.alive():
+            return False
+        handle = host.info.get("wake")
+        if not handle or not self.wake_cmd:
+            raise OSError(f"host {host.name} is not answering" + ("" if handle else " and has no wake handle")
+                          + ("" if self.wake_cmd else " (no wake_cmd in front.json)"))
+        with self.mu:
+            lk = self.wake_locks.setdefault("host:" + host.name, threading.Lock())
+        with lk:
+            if host.alive():
+                return False
+            self.log(f"host {host.name}: waking ({handle})")
+            t = time.time()
+            r = subprocess.run([self.wake_cmd, handle], capture_output=True, text=True, timeout=WAKE_WAIT)
+            if r.returncode != 0:
+                raise OSError(f"host {host.name}: wake failed: {(r.stderr or r.stdout).strip()[-300:]}")
+            while time.time() - t < WAKE_WAIT:
+                if host.alive(3):
+                    host.fetched = 0
+                    self.log(f"host {host.name}: up in {time.time() - t:.0f}s")
+                    return True
+                time.sleep(3)
+            raise OSError(f"host {host.name}: started, but its daemon didn't answer within {WAKE_WAIT}s")
 
     # -- hosts
     def hosts(self):
@@ -321,14 +361,15 @@ class Front:
             return h
         best = None
         for h in self.hosts():
-            if h.stale():
+            if h.stale() and not (h.info.get("wake") and self.wake_cmd):
                 continue
             imgs = h.info.get("images")
             if imgs is not None and stack not in imgs:
                 continue
             if imgs is None and stack not in (h.info.get("stacks") or []) and h.info:
                 continue
-            key = (h.info.get("running") if h.info.get("running") is not None else len([b for b in h.boxes.values() if b.get("running")]),
+            key = (h.stale(),             # an awake host before one that would have to be started
+                   h.info.get("running") if h.info.get("running") is not None else len([b for b in h.boxes.values() if b.get("running")]),
                    -(h.info.get("mem_free_mb") or 0))
             if best is None or key < best[0]:
                 best = (key, h)
@@ -374,7 +415,8 @@ class Front:
             if port not in ports:
                 return self.reply(c, 404, f"{name}'s ports are {ports}")
             try:
-                up = self.wake(host, name, entry)
+                up = self.ensure_host(host)
+                up = self.wake(host, name, entry) or up
             except OSError as e:
                 return self.reply(c, 503, f"{name} didn't come up: {e}", retry=30)
             try:
@@ -508,6 +550,7 @@ class Front:
     def proxy(self, c, peer, host, method, path, hdrs, rest, tag=None):
         """One daemon request, passed through byte for byte (so NDJSON streams), with the host's own token."""
         try:
+            self.ensure_host(host)
             s = host.raw(WAKE_WAIT)
         except OSError as e:
             return self.reply(c, 502, json.dumps({"error": f"{host.name}: {e}"}), "application/json")

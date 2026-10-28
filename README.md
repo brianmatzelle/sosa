@@ -100,6 +100,14 @@ whichever host has it. Put your own login in front: with a `secret_file` in `fro
 `X-Sosa-Front: <secret>` get in, and `X-Sosa-User` from your proxy is passed to the box's app. The routes and
 the config are at the top of [sosa/front.py](sosa/front.py).
 
+## On AWS
+
+[aws/](aws/) puts hosts on EC2: `aws/sosa-aws base`, `key`, `stacks`, `front`, `image`, `up host-1`. Each host is
+an instance with nested virtualization running sosad and its boxes, from an image with every stack already
+baked. Hosts register with the front door, stop themselves once every box has slept for a while, and are started
+again by the front door on the next request. Ops go over SSM; secrets live in SSM parameters and are typed with
+hidden input, never passed on argv. [aws/README.md](aws/README.md) has the whole picture.
+
 ## Stacks
 
 Yours are private. This repo ships `stacks/hello` to prove the contract. `sosa stack init DIR` writes a

@@ -67,6 +67,13 @@ with `sosa join URL --name H` (register secret asked, hidden; `--secret-file F` 
 can use the front door alone: `/_sosa/api/v1/boxes` (GET all, POST creates on the best host) and
 `/_sosa/api/v1/boxes/NAME/...` (the daemon's routes, on the right host).
 
+## On AWS
+
+`aws/sosa-aws` (help at its top) makes hosts: `base` once, `key` and `front` for the secrets (hidden input,
+so a person runs those), `stacks DIR` to upload stacks, `image` to bake the host AMI, `up HOST --idle 30` for a
+host. `aws/sosa-aws status HOST` and `run HOST -- sosa list` look inside. A stopped host is woken by the front
+door; `start HOST` does it by hand.
+
 ## The API, for a backend
 
 Same verbs over HTTP: unix socket `~/.sosa/sosad.sock`, or `sosa daemon --tcp 127.0.0.1:8790` with

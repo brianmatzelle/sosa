@@ -1,0 +1,243 @@
+#!/usr/bin/env bash
+# sosa on AWS, driven from your machine. Each host is an EC2 instance with nested virtualization running sosad
+# and the boxes (aws/host.yaml); the shared part is one stack per account and region (aws/base.yaml).
+#
+#   aws/sosa-aws base [--front-cidr CIDR | --front-sg sg-...]   the bucket and the hosts' security group (once)
+#   aws/sosa-aws key                         the Claude API key every host's relay holds (typed hidden) -> SSM
+#   aws/sosa-aws workspace ID                the key's workspace id, if it needs one -> SSM
+#   aws/sosa-aws front URL                   the front door hosts join: its URL and register secret (hidden) -> SSM
+#   aws/sosa-aws stacks DIR...               upload stacks (hosts pull them at boot; the image bakes them)
+#   aws/sosa-aws image [--type t]            bake the host image: a builder from Ubuntu, every stack's image in
+#                                            it, snapshotted as an AMI in /sosa/image/host (~30-60 min)
+#   aws/sosa-aws up HOST [--type t --disk 60 --idle 30 --name N --no-front]   a host from the image (or from
+#                                            Ubuntu while there is none), joined to the front door
+#   aws/sosa-aws status [HOST]               the instance, its first boot, its daemon and boxes
+#   aws/sosa-aws run HOST -- COMMAND         one command there, as the sosa user (over SSM)
+#   aws/sosa-aws shell HOST                  a shell there
+#   aws/sosa-aws stop|start HOST             the instance (a stopped host is woken by the front door too)
+#   aws/sosa-aws down HOST                   delete the host, its disk and every box on it (asks first)
+#
+# AWS_PROFILE and AWS_REGION as usual (AWS_REGION defaults to us-east-1). Parameters under /sosa/ in SSM:
+# /sosa/shared/{anthropic-key,workspace,front-url,front-register-secret}, /sosa/image/host, /sosa/HOST/status.
+set -euo pipefail
+REPO=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
+REGION=${AWS_REGION:-${AWS_DEFAULT_REGION:-us-east-1}}
+AWS() { aws --region "$REGION" "$@"; }
+die() { echo "sosa-aws: $*" >&2; exit 1; }
+usage() { sed -n '2,21p' "$0" >&2; exit 1; }
+UBUNTU=/aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id
+
+stack_out() {  # <stack> <output key>
+  AWS cloudformation describe-stacks --stack-name "$1" \
+    --query "Stacks[0].Outputs[?OutputKey=='$2'].OutputValue" --output text 2>/dev/null
+}
+have_stack() { AWS cloudformation describe-stacks --stack-name "$1" >/dev/null 2>&1; }
+instance_id() { local id; id=$(stack_out "$1" InstanceId); [[ -n $id && $id != None ]] || die "no host $1 (aws/sosa-aws up $1)"; echo "$id"; }
+state() { AWS ec2 describe-instances --instance-ids "$(instance_id "$1")" --query 'Reservations[0].Instances[0].State.Name' --output text; }
+awake() { local st; st=$(state "$1"); [[ $st == running ]] || die "$1 is $st: aws/sosa-aws start $1 (or let the front door wake it), then try again"; }
+param() { AWS ssm get-parameter --name "$1" --with-decryption --query Parameter.Value --output text 2>/dev/null || true; }
+put_secret() { AWS ssm put-parameter --name "$1" --type SecureString --overwrite --value "$2" >/dev/null; }
+bucket() { stack_out sosa-base Bucket; }
+need_base() { [[ -n $(bucket) && $(bucket) != None ]] || die "no sosa-base stack yet: aws/sosa-aws base"; }
+hidden() {  # <prompt> -> the value, typed with no echo (never on argv, never in chat)
+  [[ -t 0 ]] || die "run this in a terminal: it asks with hidden input"
+  local v; read -rsp "$1: " v; echo >&2; printf '%s' "$v"
+}
+subnet() {  # a default subnet, or the one given
+  [[ -n ${SOSA_SUBNET:-} ]] && { echo "$SOSA_SUBNET"; return; }
+  AWS ec2 describe-subnets --filters Name=default-for-az,Values=true --query 'Subnets[0].SubnetId' --output text
+}
+
+# One command on the host as the sosa user, in the repo, with its user manager reachable; prints the output and
+# returns the command's status. The script travels base64-encoded (SSM runs dash, and nothing gets re-quoted).
+run_on() {  # <stack> <bash script>
+  local id b64 cid st
+  awake "$1"; id=$(instance_id "$1"); b64=$(base64 -w0 <<<"$2")
+  cid=$(AWS ssm send-command --instance-ids "$id" --document-name AWS-RunShellScript \
+    --parameters "$(jq -cn --arg b "$b64" '{executionTimeout: ["7200"], commands: [
+      "f=$(mktemp) && echo \($b) | base64 -d > $f && chmod 644 $f && u=$(id -u sosa)",
+      "sudo -iu sosa env XDG_RUNTIME_DIR=/run/user/$u DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$u/bus bash -c \"cd ~/sosa && bash $f\"; rc=$?; rm -f $f; exit $rc"]}')" \
+    --query Command.CommandId --output text)
+  while :; do
+    sleep 2
+    st=$(AWS ssm get-command-invocation --command-id "$cid" --instance-id "$id" --query Status --output text 2>/dev/null || echo Pending)
+    [[ $st == Pending || $st == InProgress || $st == Delayed ]] || break
+  done
+  local out err
+  out=$(AWS ssm get-command-invocation --command-id "$cid" --instance-id "$id" --query StandardOutputContent --output text)
+  err=$(AWS ssm get-command-invocation --command-id "$cid" --instance-id "$id" --query StandardErrorContent --output text)
+  [[ -n $out ]] && printf '%s\n' "$out"
+  [[ -n $err ]] && printf '%s\n' "$err" >&2
+  [[ $st == Success ]]
+}
+
+wait_status() {  # <stack> <done-prefix> <minutes>
+  local last="" st
+  for _ in $(seq 1 $(( $3 * 6 ))); do
+    st=$(param "/sosa/$1/status")
+    [[ $st != "$last" ]] && { echo "   $1: $st"; last=$st; }
+    [[ $st == $2* || $st == *failed* || $st == no\ /dev/kvm* ]] && break
+    sleep 10
+  done
+  [[ $st == $2* ]] || die "didn't finish: $st (aws/sosa-aws shell $1; /var/log/sosa-bootstrap.log)"
+}
+
+# A host's stack may change, never replace or delete the instance (its disk holds every box on it); termination
+# protection until `down`.
+protect() {
+  AWS cloudformation set-stack-policy --stack-name "$1" --stack-policy-body '{"Statement": [
+    {"Effect": "Allow", "Action": "Update:*", "Principal": "*", "Resource": "*"},
+    {"Effect": "Deny", "Action": ["Update:Replace", "Update:Delete"], "Principal": "*", "Resource": "LogicalResourceId/Host"}]}'
+  AWS cloudformation update-termination-protection --stack-name "$1" --enable-termination-protection >/dev/null
+}
+
+cmd=${1:-}; shift || true
+case $cmd in
+  base)
+    cidr="" sg=""
+    while (($#)); do case $1 in --front-cidr) cidr=$2; shift 2 ;; --front-sg) sg=$2; shift 2 ;; *) die "base [--front-cidr CIDR | --front-sg sg-...]" ;; esac; done
+    vpc=$(AWS ec2 describe-vpcs --filters Name=isDefault,Values=true --query 'Vpcs[0].VpcId' --output text)
+    [[ $vpc == vpc-* ]] || die "no default VPC in $REGION; set one up or edit aws/base.yaml for yours"
+    [[ -n $cidr || -n $sg ]] || cidr=$(AWS ec2 describe-vpcs --vpc-ids "$vpc" --query 'Vpcs[0].CidrBlock' --output text)
+    echo "== sosa-base in $vpc: the bucket, the hosts' security group (daemon port from ${sg:-$cidr})"
+    AWS cloudformation deploy --stack-name sosa-base --template-file "$REPO/aws/base.yaml" --no-fail-on-empty-changeset \
+      --parameter-overrides VpcId="$vpc" FrontCidr="$cidr" FrontSecurityGroupId="$sg" --tags sosa:role=base
+    echo "bucket $(bucket). next: aws/sosa-aws key; aws/sosa-aws stacks DIR...; aws/sosa-aws front URL; aws/sosa-aws image"
+    ;;
+
+  key)
+    k=$(hidden "Claude API key (or a setup-token token) for every host's relay")
+    [[ $k == sk-ant-* ]] || die "that doesn't look like one"
+    put_secret /sosa/shared/anthropic-key "$k"; unset k
+    echo "stored as /sosa/shared/anthropic-key (SecureString). Hosts read it at boot; a running host: aws/sosa-aws run HOST -- sudo aws/bootstrap.sh"
+    ;;
+
+  workspace)
+    [[ -n ${1:-} ]] || die "workspace ID"
+    AWS ssm put-parameter --name /sosa/shared/workspace --type String --overwrite --value "$1" >/dev/null
+    echo "stored as /sosa/shared/workspace"
+    ;;
+
+  front)
+    url=${1:?front URL (http://front:8180)}
+    s=$(hidden "the front door's register secret (its ~/.sosa/front-register-secret)")
+    [[ -n $s ]] || die "empty"
+    put_secret /sosa/shared/front-register-secret "$s"; unset s
+    AWS ssm put-parameter --name /sosa/shared/front-url --type String --overwrite --value "${url%/}" >/dev/null
+    echo "stored: hosts from now on join ${url%/} (aws/sosa-aws up HOST); a running host: aws/sosa-aws run HOST -- sudo aws/bootstrap.sh"
+    ;;
+
+  stacks)
+    need_base; b=$(bucket)
+    (($#)) || die "stacks DIR..."
+    for d in "$@"; do
+      [[ -f $d/stack.toml ]] || die "$d has no stack.toml"
+      n=$(sed -n 's/^name *= *"\(.*\)"/\1/p' "$d/stack.toml" | head -1); n=${n:-$(basename "$(cd "$d" && pwd)")}
+      echo "== $n -> s3://$b/stacks/$n/"
+      AWS s3 sync --quiet --delete --exclude '.git/*' --exclude '__pycache__/*' "$d" "s3://$b/stacks/$n/"
+    done
+    echo "uploaded. A new host pulls them at boot; a running one: aws/sosa-aws run HOST -- sudo aws/bootstrap.sh; the image: aws/sosa-aws image"
+    ;;
+
+  image)
+    type=m8i-flex.large; stack=sosa-bake
+    while (($#)); do case $1 in --type) type=$2; shift 2 ;; *) die "image [--type t]" ;; esac; done
+    need_base
+    sub=$(subnet)
+    echo "== $stack: a builder ($type) from plain Ubuntu; it installs sosa, bakes every stack in s3://$(bucket)/stacks/, strips itself, powers off"
+    AWS ssm delete-parameter --name "/sosa/$stack/status" 2>/dev/null || true
+    AWS cloudformation deploy --stack-name "$stack" --template-file "$REPO/aws/host.yaml" --no-fail-on-empty-changeset \
+      --capabilities CAPABILITY_IAM --tags sosa:stack="$stack" sosa:role=bake --parameter-overrides InstanceType="$type" \
+      SubnetId="$sub" ImageId="$UBUNTU" Mode=bake IdleMinutes=0
+    id=$(instance_id "$stack")
+    wait_status "$stack" baked 90
+    AWS ec2 wait instance-stopped --instance-ids "$id"
+    sha=$(git -C "$REPO" rev-parse --short HEAD)
+    name="sosa-host-$(date +%Y%m%d-%H%M)-$sha"
+    echo "== AMI $name"
+    ami=$(AWS ec2 create-image --instance-id "$id" --name "$name" --description "sosa host, repo $sha (aws/sosa-aws image)" \
+      --tag-specifications "ResourceType=image,Tags=[{Key=sosa:role,Value=image},{Key=sosa:repo,Value=$sha}]" \
+        "ResourceType=snapshot,Tags=[{Key=sosa:role,Value=image},{Key=sosa:repo,Value=$sha}]" --query ImageId --output text)
+    for _ in $(seq 1 120); do  # a 60 GB snapshot can take most of an hour
+      st=$(AWS ec2 describe-images --image-ids "$ami" --query 'Images[0].State' --output text)
+      [[ $st == available ]] && break
+      [[ $st == pending ]] || die "AMI $ami is $st"
+      sleep 30
+    done
+    [[ $st == available ]] || die "AMI $ami still $st after an hour; the builder $stack is left for you"
+    AWS ssm put-parameter --name /sosa/image/host --type String --data-type aws:ec2:image --overwrite --value "$ami" >/dev/null
+    echo "== the builder goes"
+    AWS cloudformation delete-stack --stack-name "$stack"
+    AWS cloudformation wait stack-delete-complete --stack-name "$stack"
+    AWS ssm delete-parameter --name "/sosa/$stack/status" 2>/dev/null || true
+    echo "image $ami ($name) is /sosa/image/host: aws/sosa-aws up HOST makes a host from it"
+    ;;
+
+  up)
+    stack=${1:?up HOST}; shift; type=m8i-flex.large disk=60 idle=30 name="" front=1
+    while (($#)); do case $1 in --type) type=$2; shift 2 ;; --disk) disk=$2; shift 2 ;; --idle) idle=$2; shift 2 ;;
+      --name) name=$2; shift 2 ;; --no-front) front=0; shift ;; *) die "up HOST [--type t --disk 60 --idle 30 --name N --no-front]" ;; esac; done
+    [[ $stack =~ ^[a-z][a-z0-9-]{0,31}$ ]] || die "a host name is [a-z0-9-], up to 32"
+    need_base
+    sub=$(subnet); img=()
+    if ! have_stack "$stack" && [[ -z $(param /sosa/image/host) ]]; then
+      echo "   (no host image yet: plain Ubuntu, which installs everything on first boot; aws/sosa-aws image makes one)"
+      img=(ImageId=$UBUNTU)
+    fi
+    furl=""; (( front )) && furl=$(param /sosa/shared/front-url)
+    [[ $furl == None ]] && furl=""
+    (( front )) && [[ -z $furl ]] && echo "   (no front door stored: aws/sosa-aws front URL; the host will run alone)"
+    have_stack "$stack" && protect "$stack"
+    echo "== $stack ($type, nested virtualization, $disk GiB, idle stop ${idle} min${furl:+, joins $furl})"
+    AWS ssm delete-parameter --name "/sosa/$stack/status" 2>/dev/null || true
+    AWS cloudformation deploy --stack-name "$stack" --template-file "$REPO/aws/host.yaml" --no-fail-on-empty-changeset \
+      --capabilities CAPABILITY_IAM --tags sosa:stack="$stack" --parameter-overrides InstanceType="$type" SubnetId="$sub" \
+      VolumeGiB="$disk" IdleMinutes="$idle" HostName="$name" FrontUrl="$furl" "${img[@]}"
+    protect "$stack"
+    wait_status "$stack" ready 40
+    echo "$stack is up: daemon at $(stack_out "$stack" Daemon) (its ~/.sosa/api-token)${furl:+; registered with $furl as ${name:-$stack}}"
+    echo "next: boxes through the front door, or aws/sosa-aws run $stack -- sosa create NAME --stack S --idle 30 --start"
+    ;;
+
+  status)
+    if [[ -z ${1:-} ]]; then
+      AWS cloudformation describe-stacks --query "Stacks[?Tags[?Key=='sosa:stack']].[StackName,StackStatus]" --output text | sort
+      exit 0
+    fi
+    stack=$1; id=$(instance_id "$stack")
+    AWS ec2 describe-instances --instance-ids "$id" --query 'Reservations[0].Instances[0].[InstanceId,InstanceType,State.Name,PrivateIpAddress]' --output text \
+      | awk '{printf "host:   %s %s %s (private %s)\n", $1, $2, $3, $4}'
+    echo "boot:   $(param "/sosa/$stack/status")"
+    [[ $(state "$stack") == running ]] || exit 0
+    run_on "$stack" 'sosa list; sosa join --status 2>/dev/null | tail -1; sudo cat /var/lib/sosa/host-idle.json 2>/dev/null | jq -c "{busy, idle_min: ((now - .active_at) / 60 | floor)}"'
+    ;;
+
+  run)
+    stack=${1:?run HOST -- COMMAND}; shift; [[ ${1:-} == -- ]] && shift
+    run_on "$stack" "$*"
+    ;;
+
+  shell)
+    stack=${1:?shell HOST}; awake "$stack"
+    AWS ssm start-session --target "$(instance_id "$stack")" --document-name AWS-StartInteractiveCommand \
+      --parameters "$(jq -cn '{command: ["sudo -iu sosa bash -c \"cd ~/sosa && exec bash -l\""]}')"
+    ;;
+
+  stop|start)
+    stack=${1:?$cmd HOST}; id=$(instance_id "$stack")
+    AWS ec2 "$cmd-instances" --instance-ids "$id" --query '*[0].CurrentState.Name' --output text
+    ;;
+
+  down)
+    stack=${1:?down HOST}; id=$(instance_id "$stack")
+    read -rp "Delete $stack ($id): the host, its disk and every box on it? [y/N] " ok
+    [[ $ok == y ]] || exit 1
+    AWS cloudformation update-termination-protection --stack-name "$stack" --no-enable-termination-protection >/dev/null
+    AWS cloudformation delete-stack --stack-name "$stack"
+    AWS cloudformation wait stack-delete-complete --stack-name "$stack"
+    AWS ssm delete-parameter --name "/sosa/$stack/status" 2>/dev/null || true
+    echo "$stack deleted (sosa-base and its bucket stay; the front door forgets the host at its next restart)"
+    ;;
+
+  *) usage ;;
+esac

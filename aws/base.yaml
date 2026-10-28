@@ -1,0 +1,99 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  sosa on AWS, the shared part (one per account and region): the bucket hosts
+  pull stacks from, and the security group every host wears. Deployed by
+  aws/sosa-aws base as the stack "sosa-base"; each host is a stack of
+  aws/host.yaml.
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  DaemonPort:
+    Type: Number
+    Default: 8790
+    Description: the port each host's sosad listens on (its ~/.sosa/tcp)
+  FrontCidr:
+    Type: String
+    Default: ""
+    AllowedPattern: "^(|[0-9./]+)$"
+    Description: >-
+      where the front door (and your backend) call the hosts' daemons from, as
+      a CIDR (aws/sosa-aws base passes the VPC's own range unless told
+      otherwise). Nothing else reaches a host: no ssh, ops go over SSM.
+  FrontSecurityGroupId:
+    Type: String
+    Default: ""
+    AllowedPattern: "^(|sg-[0-9a-f]+)$"
+    Description: >-
+      or, instead of a CIDR, the security group the front door's instance
+      wears.
+
+Conditions:
+  BySecurityGroup: !Not [!Equals [!Ref FrontSecurityGroupId, ""]]
+  ByCidr: !Not [!Equals [!Ref FrontCidr, ""]]
+
+Resources:
+  Bucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub sosa-${AWS::AccountId}-${AWS::Region}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+      LifecycleConfiguration:
+        Rules:
+          # box exports in flight (a box moving between hosts): pulled once
+          - Id: transfers
+            Status: Enabled
+            Prefix: transfers/
+            ExpirationInDays: 14
+      Tags:
+        - {Key: sosa:role, Value: base}
+
+  HostSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: sosa-host-sg
+      GroupDescription: >-
+        sosa hosts: the daemon port from the front door only. No ssh; ops
+        over SSM. Boxes have no network interface at all.
+      VpcId: !Ref VpcId
+      Tags:
+        - {Key: sosa:role, Value: base}
+
+  DaemonFromSecurityGroup:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: BySecurityGroup
+    Properties:
+      GroupId: !Ref HostSecurityGroup
+      IpProtocol: tcp
+      FromPort: !Ref DaemonPort
+      ToPort: !Ref DaemonPort
+      SourceSecurityGroupId: !Ref FrontSecurityGroupId
+      Description: the front door
+
+  DaemonFromCidr:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: ByCidr
+    Properties:
+      GroupId: !Ref HostSecurityGroup
+      IpProtocol: tcp
+      FromPort: !Ref DaemonPort
+      ToPort: !Ref DaemonPort
+      CidrIp: !Ref FrontCidr
+      Description: the front door
+
+Outputs:
+  Bucket:
+    Value: !Ref Bucket
+    Export: {Name: sosa-base-bucket}
+  HostSecurityGroup:
+    Value: !Ref HostSecurityGroup
+    Export: {Name: sosa-base-host-sg}

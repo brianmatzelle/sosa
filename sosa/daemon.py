@@ -48,7 +48,8 @@ Joining a front door (front.py): <home>/join.json {"url": "http://front:8180", "
 right after a box changes, the daemon posts its address, api token, boxes, stacks, images, running count and free
 memory to the front, which then routes NAME.ZONE to this host's boxes and can create boxes here. The advertised
 address must be one the front can reach: the TCP address (with --tcp or <home>/tcp), or the unix socket when the
-front runs on this host.
+front runs on this host. With <home>/wake (a handle such as aws:us-east-2:i-0123..., see aws/wake.sh), the front
+door can start this host when it is stopped: it runs its wake_cmd with that handle and waits for the daemon.
 """
 import argparse
 import http.server
@@ -152,7 +153,9 @@ class Daemon:
                     mem = int(ln.split()[1]) // 1024
         except OSError:
             pass
-        body = {"name": self.host_name(), "url": url, "token": token,
+        wp = os.path.join(self.home.path, "wake")
+        wake = open(wp).read().strip() if os.path.exists(wp) else None
+        body = {"name": self.host_name(), "url": url, "token": token, "wake": wake,
                 "boxes": self.list_boxes(), "stacks": [x["name"] for x in self.stacks() if not x.get("problems")],
                 "images": [x["stack"] for x in self.images()], "running": len(self.running), "mem_free_mb": mem,
                 "cpus": os.cpu_count(), "pid": os.getpid()}

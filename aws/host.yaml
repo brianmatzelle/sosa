@@ -1,0 +1,229 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  One sosa host: an EC2 instance with nested virtualization that runs sosad and
+  the boxes. One stack per host, all from this template (aws/sosa-aws up HOST);
+  needs sosa-base (aws/base.yaml) first. From the host image (aws/sosa-aws
+  image) a host comes up with everything installed and every stack's image
+  baked, joins the front door, and is ready for boxes in a few minutes. With
+  Mode=bake it builds that image instead and powers off for the snapshot.
+
+Parameters:
+  InstanceType:
+    Type: String
+    Default: m8i-flex.large
+    # nested virtualization: Intel instance families with it (no Graviton), 2026-10
+    AllowedValues:
+      - m7i-flex.large
+      - m8i-flex.large
+      - m8i.large
+      - r8i-flex.large
+      - r8i.large
+      - m7i-flex.xlarge
+      - m8i-flex.xlarge
+      - m8i.xlarge
+      - r8i-flex.xlarge
+      - r8i.xlarge
+      - m8i-flex.2xlarge
+      - m8i.2xlarge
+      - r8i.2xlarge
+  VolumeGiB:
+    Type: Number
+    Default: 60
+    Description: root gp3, which holds the boxes' disks and their snapshots
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: a subnet the front door can reach (and that reaches the internet, for the bakes)
+  # the host image (aws/sosa-aws image keeps the newest in /sosa/image/host); its own build starts from plain
+  # Ubuntu: /aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id
+  ImageId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /sosa/image/host
+  Mode:
+    Type: String
+    Default: host
+    AllowedValues: [host, bake]
+    Description: bake = build the host image (aws/bake.sh, then the instance powers off for its snapshot)
+  HostName:
+    Type: String
+    Default: ""
+    AllowedPattern: "^[a-z0-9-]{0,32}$"
+    Description: the name this host registers with the front door under; empty = the stack's name
+  FrontUrl:
+    Type: String
+    Default: ""
+    Description: >-
+      the front door to join (http://front:8180); its register secret is read
+      from SSM /sosa/shared/front-register-secret. Empty = don't join; the
+      daemon still listens on its port for your backend.
+  IdleMinutes:
+    Type: Number
+    Default: 30
+    Description: >-
+      the host stops itself once no box has been running for this many
+      minutes (and nobody is in an SSM session); 0 = never. The front door
+      starts it again on the next request (aws/wake.sh).
+  RepoUrl:
+    Type: String
+    Default: https://github.com/brianmatzelle/sosa.git
+  Branch:
+    Type: String
+    Default: master
+
+Resources:
+  # Each host has its own role, scoped to its own parameters: one host (and whatever runs on it) can't read
+  # another's. The shared parameters every host may read: the Claude API key the relays hold, the front door's
+  # register secret, the key's workspace.
+  Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ec2.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: sosa-host
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: Stacks
+                Effect: Allow
+                Action: [s3:GetObject]
+                Resource: !Sub
+                  - arn:aws:s3:::${Bucket}/stacks/*
+                  - Bucket: !ImportValue sosa-base-bucket
+              - Sid: OwnTransfers
+                Effect: Allow
+                Action: [s3:GetObject, s3:PutObject, s3:DeleteObject]
+                Resource: !Sub
+                  - arn:aws:s3:::${Bucket}/transfers/${AWS::StackName}/*
+                  - Bucket: !ImportValue sosa-base-bucket
+              - Sid: ListBucket
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !Sub
+                  - arn:aws:s3:::${Bucket}
+                  - Bucket: !ImportValue sosa-base-bucket
+                Condition:
+                  StringLike:
+                    s3:prefix:
+                      - stacks/*
+                      - !Sub transfers/${AWS::StackName}/*
+              - Sid: OwnParameters
+                Effect: Allow
+                Action: [ssm:GetParameter, ssm:PutParameter]
+                Resource: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/sosa/${AWS::StackName}/*
+              - Sid: SharedParameters
+                Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/sosa/shared/*
+      Tags:
+        - {Key: sosa:stack, Value: !Ref AWS::StackName}
+
+  Profile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref Role]
+
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref ImageId
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile: {Arn: !GetAtt Profile.Arn}
+        SecurityGroupIds: [!ImportValue sosa-base-host-sg]
+        CpuOptions:
+          NestedVirtualization: enabled
+        # IMDSv2 and one hop: the host's own processes get the role; nothing behind it does (boxes have no
+        # network interface anyway)
+        MetadataOptions:
+          HttpTokens: required
+          HttpPutResponseHopLimit: 1
+        # powering off from inside (aws/host-idle.py) stops the instance; the front door starts it again
+        InstanceInitiatedShutdownBehavior: stop
+        BlockDeviceMappings:
+          - DeviceName: /dev/sda1
+            Ebs:
+              VolumeSize: !Ref VolumeGiB
+              VolumeType: gp3
+              Encrypted: true
+              DeleteOnTermination: true
+        TagSpecifications:
+          - ResourceType: volume
+            Tags:
+              - {Key: Name, Value: !Ref AWS::StackName}
+              - {Key: sosa:stack, Value: !Ref AWS::StackName}
+        # First boot. On plain Ubuntu: the tools, the sosa user, the clone. Then aws/bootstrap.sh from the repo
+        # (idempotent; the host image has run it already and only does what's its own). Mode=bake builds the
+        # image instead. bash vars are ${!X} here (!Sub).
+        UserData:
+          Fn::Base64: !Sub
+            - |
+              #!/bin/bash
+              set -Eeuxo pipefail
+              exec > >(tee -a /var/log/sosa-bootstrap.log) 2>&1
+              mkdir -p /etc/sosa
+              cat > /etc/sosa/aws.env <<'EOF'
+              STACK=${AWS::StackName}
+              REGION=${AWS::Region}
+              BUCKET=${Bucket}
+              MODE=${Mode}
+              HOST_NAME=${HostName}
+              FRONT_URL=${FrontUrl}
+              IDLE_MINUTES=${IdleMinutes}
+              REPO_URL=${RepoUrl}
+              BRANCH=${Branch}
+              EOF
+              status() { aws ssm put-parameter --region ${AWS::Region} --name /sosa/${AWS::StackName}/status --type String --overwrite --value "$1" >/dev/null 2>&1 || true; }
+              trap 'status "first boot failed at line $LINENO (see /var/log/sosa-bootstrap.log)"' ERR
+              H=/home/sosa
+              REPO=$H/sosa
+              # the host image (aws/bake.sh) has all of this already
+              if [ ! -f /etc/sosa/image ]; then
+                apt-get update
+                DEBIAN_FRONTEND=noninteractive apt-get install -y git jq unzip curl
+                if ! command -v aws; then
+                  curl -fsSL -o /tmp/awscli.zip https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip
+                  unzip -qo /tmp/awscli.zip -d /tmp && /tmp/aws/install --update
+                fi
+                # the user the daemon and the boxes run as; kvm for cloud-hypervisor
+                id sosa || useradd -m -s /bin/bash -G kvm sosa
+              fi
+              status "first boot: cloning"
+              if [ ! -d $REPO/.git ]; then
+                sudo -iu sosa git clone -q -b ${Branch} ${RepoUrl} $REPO
+              else
+                sudo -iu sosa git -C $REPO pull -q --ff-only || true
+              fi
+              READY_STATUS="bootstrapped" $REPO/aws/bootstrap.sh
+              if [ "${Mode}" = bake ]; then
+                $REPO/aws/bake.sh
+                exit 0
+              fi
+              status "ready"
+            - Bucket: !ImportValue sosa-base-bucket
+
+  Host:
+    Type: AWS::EC2::Instance
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      SubnetId: !Ref SubnetId
+      Tags:
+        - {Key: Name, Value: !Ref AWS::StackName}
+        - {Key: sosa:stack, Value: !Ref AWS::StackName}
+        - {Key: sosa:role, Value: host}
+
+Outputs:
+  InstanceId:
+    Value: !Ref Host
+  PrivateIp:
+    Value: !GetAtt Host.PrivateIp
+  Daemon:
+    Value: !Sub http://${Host.PrivateIp}:8790
+    Description: what the host advertises to the front door (token in its ~/.sosa/api-token)
