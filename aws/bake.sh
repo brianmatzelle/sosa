@@ -10,7 +10,8 @@ set -Eeuo pipefail
 U=sosa H=/home/sosa
 REPO=$H/sosa
 UID_=$(id -u $U)
-as_u() { sudo -iu $U env XDG_RUNTIME_DIR=/run/user/$UID_ DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$UID_/bus bash -c "$*"; }
+# (not sudo -i: it backslash-escapes the command, and a glob or a ~ in it expands to nothing)
+as_u() { sudo -u $U -H env XDG_RUNTIME_DIR=/run/user/$UID_ DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$UID_/bus bash -lc "$*"; }
 status() { aws ssm put-parameter --region "$REGION" --name "/sosa/$STACK/status" --type String --overwrite --value "$1" >/dev/null 2>&1 || true; }
 step() { printf '\n== %s\n' "$*"; status "baking: $*"; }
 trap 'status "bake failed at line $LINENO (see /var/log/sosa-bootstrap.log)"' ERR

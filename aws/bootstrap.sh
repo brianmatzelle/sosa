@@ -24,7 +24,8 @@ status() {
 }
 trap 'status "bootstrap failed at line $LINENO (see /var/log/sosa-bootstrap.log)"' ERR
 # as the sosa user, with its user manager reachable (for systemctl --user)
-as_u() { sudo -iu $U env XDG_RUNTIME_DIR=/run/user/$UID_ DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$UID_/bus bash -c "$*"; }
+# (not sudo -i: it backslash-escapes the command, and a glob or a ~ in it expands to nothing)
+as_u() { sudo -u $U -H env XDG_RUNTIME_DIR=/run/user/$UID_ DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$UID_/bus bash -lc "$*"; }
 param() { aws ssm get-parameter --region "$REGION" --name "$1" --with-decryption --query Parameter.Value --output text 2>/dev/null || true; }
 imds() {  # IMDSv2
   local tok
@@ -69,6 +70,8 @@ if [[ ${mgr:-0} != 0 ]] && ! grep '^Groups:' "/proc/$mgr/status" | grep -qw "$kg
   for _ in $(seq 1 30); do [[ -S /run/user/$UID_/bus ]] && break; sleep 1; done
 fi
 ln -sf "$REPO/bin/sosa" /usr/local/bin/sosa
+# ops arrive over SSM as root anyway; this lets `aws/sosa-aws run HOST -- sudo ...` and status work as the sosa user
+echo "$U ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/sosa && chmod 440 /etc/sudoers.d/sosa
 
 step "sosa install (hypervisor, base image, the daemon's unit)"
 as_u "cd $REPO && ./install.sh" | sed 's/^/   /'
