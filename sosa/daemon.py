@@ -40,6 +40,15 @@ The API (JSON in, JSON out; the streaming calls answer NDJSON, one event a line)
   GET  /v1/boxes/{n}/transcript?n=20     the last turns
   GET  /v1/boxes/{n}/serial?n=50         the serial console's tail
   GET  /v1/usage?days=7                  what the relay counted, by day and box
+  GET  /v1/join                          the front door this host reports to (<home>/join.json), and the last answer
+  POST /v1/join                          re-read join.json and report to the front door now (sosa join)
+
+Joining a front door (front.py): <home>/join.json {"url": "http://front:8180", "name": "host-1",
+"advertise": "http://10.0.0.5:8790"} and the front's register secret in <home>/join-secret. Every 30 s, and
+right after a box changes, the daemon posts its address, api token, boxes, stacks, images, running count and free
+memory to the front, which then routes NAME.ZONE to this host's boxes and can create boxes here. The advertised
+address must be one the front can reach: the TCP address (with --tcp or <home>/tcp), or the unix socket when the
+front runs on this host.
 """
 import argparse
 import http.server
@@ -102,7 +111,90 @@ class Daemon:
         self.mu = threading.Lock()
         self.relay_on = False
         self.harness = open(os.path.join(HERE, "harness.md")).read()
+        self.advertise = f"unix://{os.path.join(home.path, 'sosad.sock')}"
+        self.changed = threading.Event()   # a box came, went, started or stopped: tell the front door soon
+        self.join_last = None
+        self.changed.set()                 # the first report goes out at once
         threading.Thread(target=self.janitor, daemon=True).start()
+        threading.Thread(target=self.heartbeats, daemon=True).start()
+
+    # -- the front door
+    def host_name(self):
+        try:
+            conf = self.join_conf() or {}
+        except ValueError:
+            conf = {}
+        return conf.get("name") or socket.gethostname().split(".")[0]
+
+    def join_conf(self):
+        p = os.path.join(self.home.path, "join.json")
+        if not os.path.exists(p):
+            return None
+        with open(p) as f:
+            return json.load(f)
+
+    def heartbeat(self, conf=None):
+        """One report to the front door; returns its answer. Raises on anything wrong."""
+        conf = conf or self.join_conf()
+        if not conf or not conf.get("url"):
+            raise BoxError("not joined to a front door (sosa join URL)")
+        sp = os.path.expanduser(conf.get("secret_file") or os.path.join(self.home.path, "join-secret"))
+        secret = open(sp).read().strip()
+        tp = os.path.join(self.home.path, "api-token")
+        token = open(tp).read().strip() if os.path.exists(tp) else None
+        url = conf.get("advertise") or self.advertise
+        if url.startswith("http://") and not token:
+            raise BoxError("advertising a TCP address needs the api token (start sosad with --tcp or <home>/tcp)")
+        mem = 0
+        try:
+            for ln in open("/proc/meminfo"):
+                if ln.startswith("MemAvailable:"):
+                    mem = int(ln.split()[1]) // 1024
+        except OSError:
+            pass
+        body = {"name": self.host_name(), "url": url, "token": token,
+                "boxes": self.list_boxes(), "stacks": [x["name"] for x in self.stacks() if not x.get("problems")],
+                "images": [x["stack"] for x in self.images()], "running": len(self.running), "mem_free_mb": mem,
+                "cpus": os.cpu_count(), "pid": os.getpid()}
+        import http.client
+        u = urllib.parse.urlsplit(conf["url"])
+        c = http.client.HTTPConnection(u.hostname, u.port or 80, timeout=10)
+        data = json.dumps(body).encode()
+        c.request("POST", "/_sosa/register", body=data, headers={"content-type": "application/json", "x-sosa-register": secret,
+                                                                 "host": u.netloc})
+        r = c.getresponse()
+        raw = r.read()
+        c.close()
+        try:
+            ans = json.loads(raw)
+        except ValueError:
+            raise BoxError(f"front door {conf['url']}: HTTP {r.status}: {raw[:200]!r}")
+        if r.status != 200:
+            raise BoxError(f"front door {conf['url']}: {ans.get('error') or 'HTTP ' + str(r.status)}")
+        return ans
+
+    def heartbeats(self):
+        last = None
+        while True:
+            self.changed.wait(30)
+            self.changed.clear()
+            try:
+                conf = self.join_conf()
+            except ValueError as e:
+                conf = None
+                self.log(f"join.json: {e}")
+            if not conf:
+                continue
+            try:
+                ans = self.heartbeat(conf)
+                st = f"registered with {conf['url']} as {ans.get('name')} for *.{ans.get('zone')}"
+                self.join_last = {"ok": True, "at": time.strftime("%FT%T"), **ans}
+            except (BoxError, OSError, ValueError) as e:
+                st = f"front door: {e}"
+                self.join_last = {"ok": False, "at": time.strftime("%FT%T"), "error": str(e)}
+            if st != last:
+                self.log(st)
+                last = st
 
     def touch(self, name):
         r = self.running.get(name)
@@ -216,7 +308,7 @@ class Daemon:
             auth = req.get("auth") or ("relay" if os.path.exists(os.path.join(self.home.path, "anthropic-key")) else "token")
             if auth not in ("relay", "token"):
                 raise BoxError("auth is relay or token")
-            cid = 3 + len(self.home.names())
+            cid = int(req.get("cid") or 0) or 3 + len(self.home.names())
             conf = box.create(stack, image=req.get("image"), mem=req.get("mem"), cpus=req.get("cpus"), disk=req.get("disk"),
                               auth=auth, owner=req.get("owner") or "", cid=cid,
                               preview_port=self.free_preview_port() if stack.has_app else None)
@@ -225,6 +317,7 @@ class Daemon:
                 box.save_conf({**box.conf, "idle": idle})
             self.log(f"{name}: created from {os.path.basename(conf['image'])} ({stack.name}), {conf['mem']}, "
                      f"{conf['cpus']} vcpu, {conf['disk']}, auth {auth}")
+            self.changed.set()
         if req.get("start"):
             self.start(name)
         return self.status(name)
@@ -259,6 +352,7 @@ class Daemon:
             if not c.get("up") or c.get("asleep"):
                 box.save_conf({k: v for k, v in {**box.conf, "up": True}.items() if k != "asleep"})
             self.log(f"{name}: up (claude {h.get('claude')}, auth {h.get('auth')})")
+            self.changed.set()
         return self.status(name)
 
     def start_wanted(self):
@@ -332,6 +426,7 @@ class Daemon:
             if r:
                 r.done.wait(15)       # the supervisor's cleanup (its preview sockets) before anything binds again
             self.log(f"{name}: {how}")
+            self.changed.set()
             return {"name": name, "result": how}
         finally:
             if got:
@@ -347,13 +442,14 @@ class Daemon:
             if r:
                 r.done.wait(15)
             self.log(f"{name}: destroyed")
+        self.changed.set()
         return {"name": name, "destroyed": True}
 
     def status(self, name):
         box = self.box(name)
         c = box.conf
         r = self.running.get(name)
-        st = {"name": name, "stack": c["stack"], "running": box.running(), "mem": c["mem"], "cpus": c["cpus"],
+        st = {"name": name, "host": self.host_name(), "stack": c["stack"], "running": box.running(), "mem": c["mem"], "cpus": c["cpus"],
               "disk": c["disk"], "auth": c["auth"], "owner": c.get("owner"), "created": c["created"],
               "disk_usage": box.disk_usage(), "snapshots": len(box.list_snapshots()), "egress": box.egress_counts(),
               "preview": None, "ports": c.get("ports") or [], "idle": int(c.get("idle") or 0), "asleep": c.get("asleep")}
@@ -379,7 +475,7 @@ class Daemon:
         for n in self.home.names():
             try:
                 c = Box(self.home, n).conf
-                out.append({"name": n, "stack": c["stack"], "running": n in self.running and Box(self.home, n).running(),
+                out.append({"name": n, "host": self.host_name(), "stack": c["stack"], "running": n in self.running and Box(self.home, n).running(),
                             "auth": c["auth"], "owner": c.get("owner"), "created": c["created"], "bake": bool(c.get("bake")),
                             "ports": c.get("ports") or [], "idle": int(c.get("idle") or 0), "asleep": c.get("asleep")})
             except BoxError:
@@ -494,6 +590,11 @@ class Daemon:
         if not box.running():
             return send({"type": "error", "message": f"{name} is not running (sosa start {name})"})
         self.touch(name)
+        if box.health(3) is None:          # just started: give the mind time to come up rather than fail the turn
+            try:
+                box.wait_mind(90)
+            except BoxError as e:
+                return send({"type": "error", "message": f"{name}: {e}"})
         stack = self.stack_for(box)
         a = box.conf.get("agent") or stack.agent
         text = req.get("text")
@@ -846,6 +947,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self.stream(lambda send: d.check(b.get("stack") or "", bool(b.get("quick")), send))
             if p == ["usage"] and method == "GET":
                 return self.send_json(200, d.usage(int(q.get("days", ["7"])[0])))
+            if p == ["join"]:
+                if method == "GET":
+                    return self.send_json(200, {"join": d.join_conf(), "advertise": d.advertise, "last": d.join_last})
+                if method == "POST":
+                    conf = d.join_conf()
+                    if not conf:
+                        return self.send_json(200, {"join": None, "last": None})
+                    ans = d.heartbeat(conf)
+                    d.join_last = {"ok": True, "at": time.strftime("%FT%T"), **ans}
+                    d.changed.set()
+                    return self.send_json(200, {"join": conf, "advertise": d.advertise, "last": d.join_last})
             if p == ["boxes"]:
                 if method == "GET":
                     return self.send_json(200, {"boxes": d.list_boxes()})
@@ -998,13 +1110,15 @@ def main():
     except OSError:
         print("sosad: another daemon holds this home", file=sys.stderr)
         sys.exit(0)
+    if not a.tcp and os.path.exists(os.path.join(home.path, "tcp")):
+        a.tcp = open(os.path.join(home.path, "tcp")).read().strip() or None
     d = Daemon(home)
+    if a.tcp:
+        d.advertise = f"http://{a.tcp}"
     Handler.d = d
     sock = os.path.join(home.path, "sosad.sock")
     with open(os.path.join(home.path, "sosad.pid"), "w") as f:
         f.write(str(os.getpid()))
-    if not a.tcp and os.path.exists(os.path.join(home.path, "tcp")):
-        a.tcp = open(os.path.join(home.path, "tcp")).read().strip() or None
     d.start_relay()
     srv = UnixServer(sock, Handler)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
@@ -1018,7 +1132,11 @@ def main():
             with open(os.open(tp, os.O_WRONLY | os.O_CREAT, 0o600), "w") as f:
                 f.write(secrets.token_urlsafe(32) + "\n")
         TcpHandler = type("TcpHandler", (Handler,), {"api_token": open(tp).read().strip()})
-        t = TcpServer((host or "127.0.0.1", int(port)), TcpHandler)
+        try:
+            t = TcpServer((host or "127.0.0.1", int(port)), TcpHandler)
+        except OSError as e:
+            d.log(f"sosad: can't listen on {a.tcp}: {e} (another program has it? change <home>/tcp)")
+            sys.exit(1)
         threading.Thread(target=t.serve_forever, daemon=True).start()
         d.log(f"sosad also on {a.tcp} (bearer token in {tp})")
     import signal

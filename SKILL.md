@@ -61,7 +61,11 @@ cat ~/.sosa/boxes/t1/egress.log                 # what the box tried to reach (R
 
 `sosa front --zone example.com` serves `http://NAME.example.com/` for every box, waking one that is asleep.
 `sosa idle NAME 30` makes a box sleep after 30 untouched minutes; `sosa list` shows `asleep`. A request, a
-turn or `sosa start` wakes it. `http://example.com/_sosa/boxes` lists the routes.
+turn or `sosa start` wakes it. `http://example.com/_sosa/boxes` lists the routes. A host joins a front door
+with `sosa join URL --name H` (register secret asked, hidden; `--secret-file F` without a terminal);
+`sosa join --status` says whether the last report was accepted; `sosa hosts` lists every host there. A backend
+can use the front door alone: `/_sosa/api/v1/boxes` (GET all, POST creates on the best host) and
+`/_sosa/api/v1/boxes/NAME/...` (the daemon's routes, on the right host).
 
 ## The API, for a backend
 

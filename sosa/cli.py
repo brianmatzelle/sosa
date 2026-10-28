@@ -29,7 +29,10 @@
     sosa key                              paste the Claude API key the relay holds (hidden); boxes then default to relay auth
     sosa daemon [--tcp 127.0.0.1:8790]    run sosad in the foreground (an address in ~/.sosa/tcp makes every start listen there)
     sosa front [--listen 127.0.0.1:8180 --zone localhost]   the front door: http://NAME.ZONE/ is box NAME's app, woken
-                                          on request; hosts and a login secret in ~/.sosa/front.json (sosa/front.py)
+                                          on request; hosts register themselves; a login secret in ~/.sosa/front.json
+    sosa join URL [--name H --advertise URL --secret-file F]   this host reports to the front door at URL from now on
+                                          (asks for its register secret, hidden); sosa join --status | --leave
+    sosa hosts                            what the front door this host joined knows: hosts, boxes, free memory
     sosa usage [DAYS]                     what the relay counted
   --json on any command prints the daemon's answer as it came. SOSA_HOME (default ~/.sosa).
 """
@@ -203,6 +206,69 @@ def main(argv=None):
     if cmd == "front":
         ensure_daemon()
         os.execv(PY, [PY, "-I", os.path.join(HERE, "front.py"), "--home", HOME] + rest)
+    if cmd == "join":
+        o = sub([(("url",), {"nargs": "?"}), (("--name",), {}), (("--advertise",), {}), (("--secret-file",), {}),
+                 (("--status",), {"action": "store_true"}), (("--leave",), {"action": "store_true"})], rest)
+        jp, sp = os.path.join(HOME, "join.json"), os.path.join(HOME, "join-secret")
+        if o.leave:
+            for f in (jp, sp):
+                try:
+                    os.unlink(f)
+                except FileNotFoundError:
+                    pass
+            print("left: this host no longer reports to a front door (the front door forgets it on its own restart)")
+            return 0
+        if o.url:
+            if o.secret_file:
+                sec = open(os.path.expanduser(o.secret_file)).read().strip()
+            elif os.path.exists(sp):
+                sec = ""
+            elif sys.stdin.isatty():
+                sec = getpass.getpass("the front door's register secret (its ~/.sosa/front-register-secret, hidden): ").strip()
+            else:
+                die(f"no terminal to ask for the register secret: put it in {sp} (0600) or pass --secret-file F")
+            if sec:
+                with open(os.open(sp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
+                    f.write(sec + "\n")
+            conf = {"url": o.url.rstrip("/")}
+            if o.name:
+                conf["name"] = o.name
+            if o.advertise:
+                conf["advertise"] = o.advertise
+            with open(jp, "w") as f:
+                json.dump(conf, f)
+        d = call("POST" if o.url else "GET", "/v1/join")
+        if out(d, J):
+            return 0
+        if not d.get("join"):
+            print("not joined to a front door (sosa join URL)")
+            return 0
+        last = d.get("last") or {}
+        print(f"front door {d['join']['url']}; this host advertises {d['join'].get('advertise') or d.get('advertise')}"
+              + (f" as {d['join']['name']}" if d['join'].get('name') else ""))
+        if last.get("ok"):
+            print(f"  registered at {last['at']} as {last.get('name')} for *.{last.get('zone')}; {last.get('hosts')} host(s) there"
+                  + (f"; duplicates: {', '.join(last['duplicates'])}" if last.get("duplicates") else ""))
+        elif last:
+            print(f"  NOT registered ({last['at']}): {last.get('error')}")
+        else:
+            print("  no report yet (the daemon reports within 30 s)")
+        return 0
+    if cmd == "hosts":
+        d = call("GET", "/v1/join")
+        if not d.get("join"):
+            die("not joined to a front door (sosa join URL); or ask the front door: GET http://ZONE/_sosa/hosts")
+        sec = open(os.path.join(HOME, "join-secret")).read().strip()
+        import urllib.request
+        rq = urllib.request.Request(d["join"]["url"] + "/_sosa/hosts", headers={"x-sosa-register": sec})
+        with urllib.request.urlopen(rq, timeout=15) as r:
+            h = json.loads(r.read())
+        if out(h, J):
+            return 0
+        for x in h["hosts"]:
+            print(f"{x['name']:<12} {x['url']:<40} {'stale' if x.get('stale') else ('seen ' + (x.get('seen') or '-')):<24} "
+                  f"running {x.get('running', '?')}/{len(x.get('boxes') or [])}  free {x.get('mem_free_mb') or '?'} MB  images {', '.join(x.get('images') or []) or '-'}")
+        return 0
     if cmd == "install":
         os.execv("/bin/bash", ["bash", os.path.join(REPO, "install.sh")] + rest)
     if cmd == "key":

@@ -85,13 +85,20 @@ ports to put behind your own proxy. Boxes that were up come back when the daemon
 of its other ports. A box that is asleep or down is started on the first request, which waits (about eight
 seconds from a baked image) instead of failing. A box with an idle timer (`sosa create --idle 30`, `sosa idle
 NAME 30`) is stopped and marked asleep after that many minutes without a turn, an exec or a request, so a host
-can hold far more boxes than it can run. The front door finds boxes on hosts: the local daemon by default, or a
-list of daemons in `~/.sosa/front.json`, each by its unix socket or TCP address and token. The preview rides
-inside the daemon's API (`POST /v1/boxes/NAME/tunnel`), so a host's preview ports never leave its loopback and
-one front door can stand in front of many hosts. Put your own login in front of it: with a `secret_file` in
-`front.json`, only requests carrying `X-Sosa-Front: <secret>` get in, and `X-Sosa-User` from your proxy is
-passed to the box's app. `GET http://ZONE/_sosa/boxes` lists what it routes. Details at the top of
-[sosa/front.py](sosa/front.py).
+can hold far more boxes than it can run.
+
+Hosts announce themselves. On each host, `sosa join http://front:8180 --name host-1` (it asks for the front
+door's register secret) makes the daemon report its address, token, boxes, stacks, images and free memory every
+30 seconds and whenever a box changes. The front door keeps the registry on disk, routes `NAME.ZONE` to whichever
+host has NAME, and refuses a name two hosts claim. The preview rides inside the daemon's API
+(`POST /v1/boxes/NAME/tunnel`), so a host's preview ports never leave its loopback.
+
+That makes the front door the one address for a backend too: `GET /_sosa/api/v1/boxes` lists every host's
+boxes, `POST /_sosa/api/v1/boxes` creates one on the host with the stack's image and the fewest boxes running (or
+on `"host"`), and `/_sosa/api/v1/boxes/NAME/...` is the daemon's own route for that box, streamed through, on
+whichever host has it. Put your own login in front: with a `secret_file` in `front.json`, only requests carrying
+`X-Sosa-Front: <secret>` get in, and `X-Sosa-User` from your proxy is passed to the box's app. The routes and
+the config are at the top of [sosa/front.py](sosa/front.py).
 
 ## Stacks
 
