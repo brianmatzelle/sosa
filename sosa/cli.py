@@ -2,8 +2,10 @@
 """sosa: an agent in a box. The CLI is a thin client of sosad (sosa/daemon.py), which it starts if it isn't up.
 
   boxes
-    sosa create NAME --stack S [--mem 2G --cpus 2 --disk 10G --auth relay|token --owner WHO] [--start]
+    sosa create NAME --stack S [--mem 2G --cpus 2 --disk 10G --auth relay|token --owner WHO --idle MIN] [--start]
     sosa start|stop|restart NAME          start waits for the mind (first boot ~30 s); stop is the power button
+    sosa idle NAME MINUTES                untouched for that long, the box is stopped and marked asleep (0: never);
+                                          a start, or a request at the front door, wakes it
     sosa list                             every box; `sosa status NAME` for one, with the mind, app and preview
     sosa ask NAME "text" [--who W --role owner|guest --channel C --model M --effort E]   one turn, streamed
     sosa chat NAME [--who W --role R]     a conversation in the terminal (Ctrl-D ends it)
@@ -26,6 +28,8 @@
     sosa install                          hypervisor, base image, dirs (install.sh)
     sosa key                              paste the Claude API key the relay holds (hidden); boxes then default to relay auth
     sosa daemon [--tcp 127.0.0.1:8790]    run sosad in the foreground (an address in ~/.sosa/tcp makes every start listen there)
+    sosa front [--listen 127.0.0.1:8180 --zone localhost]   the front door: http://NAME.ZONE/ is box NAME's app, woken
+                                          on request; hosts and a login secret in ~/.sosa/front.json (sosa/front.py)
     sosa usage [DAYS]                     what the relay counted
   --json on any command prints the daemon's answer as it came. SOSA_HOME (default ~/.sosa).
 """
@@ -196,6 +200,9 @@ def main(argv=None):
 
     if cmd == "daemon":
         os.execv(PY, [PY, "-I", os.path.join(HERE, "daemon.py"), "--home", HOME] + rest)
+    if cmd == "front":
+        ensure_daemon()
+        os.execv(PY, [PY, "-I", os.path.join(HERE, "front.py"), "--home", HOME] + rest)
     if cmd == "install":
         os.execv("/bin/bash", ["bash", os.path.join(REPO, "install.sh")] + rest)
     if cmd == "key":
@@ -306,14 +313,16 @@ def main(argv=None):
         if out(d, J):
             return 0
         for b in d["boxes"]:
-            print(f"{b['name']:<16} {'running' if b['running'] else 'down':<8} {b['stack']:<12} {b['auth']:<6} "
-                  f"{b.get('owner') or ''}{'  (bake)' if b.get('bake') else ''}")
+            state = "running" if b["running"] else ("asleep" if b.get("asleep") else "down")
+            print(f"{b['name']:<16} {state:<8} {b['stack']:<12} {b['auth']:<6} "
+                  f"{b.get('owner') or ''}{'  (bake)' if b.get('bake') else ''}{'  idle ' + str(b['idle']) + 'm' if b.get('idle') else ''}")
         if not d["boxes"]:
             print("no boxes (sosa create NAME --stack S)")
         return 0
     if cmd == "create":
         o = sub([(("name",), {}), (("--stack",), {"required": True}), (("--mem",), {}), (("--cpus",), {"type": int}),
                  (("--disk",), {}), (("--auth",), {"choices": ["relay", "token"]}), (("--owner",), {}),
+                 (("--idle",), {"type": int, "help": "minutes untouched before it sleeps"}),
                  (("--start",), {"action": "store_true"})], rest)
         body = {k: v for k, v in vars(o).items() if v is not None and v is not False}
         d = call("POST", "/v1/boxes", body)
@@ -333,7 +342,10 @@ def main(argv=None):
         if out(d, J):
             return 0
         du = d.get("disk_usage") or {}
-        print(f"{d['name']}: {'running since ' + d['since'] if d['running'] else 'down'}; stack {d['stack']}, {d['mem']}, "
+        state = "running since " + d["since"] if d["running"] else ("asleep since " + d["asleep"] if d.get("asleep") else "down")
+        if d.get("idle"):
+            state += f"; sleeps after {d['idle']} min idle" + (f" (idle {d['idle_for'] // 60} min now)" if "idle_for" in d else "")
+        print(f"{d['name']}: {state}; stack {d['stack']}, {d['mem']}, "
               f"{d['cpus']} vcpu, disk {d['disk']} ({human(du.get('used', 0))} used); auth {d['auth']}; "
               f"{d['snapshots']} snapshot(s); egress {d['egress']['allowed']} allowed, {d['egress']['refused']} refused")
         if d["egress"].get("last_refused"):
@@ -369,6 +381,14 @@ def main(argv=None):
         if out(d, J):
             return 0
         print(f"{name}: {d['result']}")
+        return 0
+    if cmd == "idle":
+        if not args or not args[0].isdigit():
+            die(f"idle {name} MINUTES (0: never)")
+        d = call("POST", f"/v1/boxes/{name}/idle", {"minutes": int(args[0])})
+        if out(d, J):
+            return 0
+        print(f"{name}: " + (f"sleeps after {d['idle']} min untouched" if d["idle"] else "never sleeps"))
         return 0
     if cmd == "restart":
         call("POST", f"/v1/boxes/{name}/stop")

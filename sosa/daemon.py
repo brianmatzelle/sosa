@@ -6,7 +6,8 @@
 It listens on <home>/sosad.sock (0600; the CLI's path) and, with --tcp, on that address too, where every request
 must carry `Authorization: Bearer <home>/api-token`. It runs the boxes' cloud-hypervisors and egress proxies as
 children and restarts one that dies; the Claude relay (relay.py), when <home>/anthropic-key exists; and the
-preview listeners: 127.0.0.1:<box's preview port + i> -> the box's i-th app port, over vsock.
+preview listeners: 127.0.0.1:<box's preview port + i> -> the box's i-th app port, over vsock. Boxes with an idle
+timer are stopped (and marked asleep) when nothing has touched them for that long; front.py wakes them on a request.
 
 The API (JSON in, JSON out; the streaming calls answer NDJSON, one event a line):
   GET  /v1/health                        the daemon, how many boxes are up, the relay
@@ -17,10 +18,16 @@ The API (JSON in, JSON out; the streaming calls answer NDJSON, one event a line)
   POST /v1/images        {stack}         bake the stack's image: streams log lines, ends with {"done":...}
   POST /v1/check         {stack,quick}   the contract test: streams, ends with {"done":true|false, "problems":[]}
   GET  /v1/boxes                         every box, running or not
-  POST /v1/boxes         {name,stack,mem?,cpus?,disk?,auth?,owner?,start?}   make one (auth: relay | token)
+  POST /v1/boxes         {name,stack,mem?,cpus?,disk?,auth?,owner?,idle?,start?}   make one (auth: relay | token;
+                                         idle: minutes without a turn, exec or preview connection before it is
+                                         stopped and marked asleep; 0 = never. A start wakes it; so does the front door)
   GET  /v1/boxes/{n}                     status: running, mind health, app, egress counts, disk
   DELETE /v1/boxes/{n}                   stop and delete it (snapshots too; the token is kept)
   POST /v1/boxes/{n}/start | stop        start waits for the mind; stop is the power button
+  POST /v1/boxes/{n}/idle  {minutes}     change the idle timer
+  POST /v1/boxes/{n}/tunnel {port,wake?} the connection becomes a raw bridge to that app port after a bare
+                                         `HTTP/1.1 200` line: what front.py uses to reach a preview on any host.
+                                         wake (default true): a box that is asleep is started first
   POST /v1/boxes/{n}/turn  {text,who?,role?,channel?,model?,effort?,max_turns?,max_budget_usd?}
          -> {"type":"facts",..} {"type":"delta","text"} {"type":"tool",..} {"type":"done",..} | {"type":"error",..}
   POST /v1/boxes/{n}/cancel | new        kill the turn under way | forget the session
@@ -82,6 +89,7 @@ class Running:
         self.restarts = []
         self.previews = []            # listening sockets
         self.done = threading.Event() # set once the supervisor has cleaned up after the VM exited
+        self.last_active = time.time()  # a turn, an exec from the API, a preview or tunnel connection
 
 
 class Daemon:
@@ -94,6 +102,32 @@ class Daemon:
         self.mu = threading.Lock()
         self.relay_on = False
         self.harness = open(os.path.join(HERE, "harness.md")).read()
+        threading.Thread(target=self.janitor, daemon=True).start()
+
+    def touch(self, name):
+        r = self.running.get(name)
+        if r:
+            r.last_active = time.time()
+
+    def janitor(self):
+        """Stops boxes whose idle timer has run out (and marks them asleep, so a daemon restart leaves them down)."""
+        while True:
+            time.sleep(30)
+            for name, r in list(self.running.items()):
+                try:
+                    box = self.box(name)
+                    idle = int(box.conf.get("idle") or 0)
+                    if idle <= 0 or r.stopping or time.time() - r.last_active < idle * 60:
+                        continue
+                    h = box.health(3)
+                    if h and (h.get("busy") or h.get("queued")):
+                        r.last_active = time.time()
+                        continue
+                    self.log(f"{name}: idle for {idle} min; stopping (asleep)")
+                    box.save_conf({**box.conf, "up": False, "asleep": time.strftime("%FT%T")})
+                    self.stop(name, wanted_down=False)
+                except (BoxError, OSError, ConnectionError, ValueError) as e:
+                    self.log(f"{name}: idle check: {e}")
 
     def lock(self, name):
         with self.mu:
@@ -186,6 +220,9 @@ class Daemon:
             conf = box.create(stack, image=req.get("image"), mem=req.get("mem"), cpus=req.get("cpus"), disk=req.get("disk"),
                               auth=auth, owner=req.get("owner") or "", cid=cid,
                               preview_port=self.free_preview_port() if stack.has_app else None)
+            idle = int(req.get("idle") or 0)
+            if idle:
+                box.save_conf({**box.conf, "idle": idle})
             self.log(f"{name}: created from {os.path.basename(conf['image'])} ({stack.name}), {conf['mem']}, "
                      f"{conf['cpus']} vcpu, {conf['disk']}, auth {auth}")
         if req.get("start"):
@@ -219,8 +256,8 @@ class Daemon:
             self.ensure_auth(box, h)
             self.open_previews(box, r)
             h = box.health(3) or h
-            if not c.get("up"):
-                box.save_conf({**box.conf, "up": True})
+            if not c.get("up") or c.get("asleep"):
+                box.save_conf({k: v for k, v in {**box.conf, "up": True}.items() if k != "asleep"})
             self.log(f"{name}: up (claude {h.get('claude')}, auth {h.get('auth')})")
         return self.status(name)
 
@@ -319,7 +356,9 @@ class Daemon:
         st = {"name": name, "stack": c["stack"], "running": box.running(), "mem": c["mem"], "cpus": c["cpus"],
               "disk": c["disk"], "auth": c["auth"], "owner": c.get("owner"), "created": c["created"],
               "disk_usage": box.disk_usage(), "snapshots": len(box.list_snapshots()), "egress": box.egress_counts(),
-              "preview": None}
+              "preview": None, "ports": c.get("ports") or [], "idle": int(c.get("idle") or 0), "asleep": c.get("asleep")}
+        if r and not r.stopping:
+            st["idle_for"] = int(time.time() - r.last_active)
         if r:
             st["since"] = time.strftime("%FT%T", time.localtime(r.since))
         if st["running"]:
@@ -341,7 +380,8 @@ class Daemon:
             try:
                 c = Box(self.home, n).conf
                 out.append({"name": n, "stack": c["stack"], "running": n in self.running and Box(self.home, n).running(),
-                            "auth": c["auth"], "owner": c.get("owner"), "created": c["created"], "bake": bool(c.get("bake"))})
+                            "auth": c["auth"], "owner": c.get("owner"), "created": c["created"], "bake": bool(c.get("bake")),
+                            "ports": c.get("ports") or [], "idle": int(c.get("idle") or 0), "asleep": c.get("asleep")})
             except BoxError:
                 pass
         return out
@@ -381,6 +421,7 @@ class Daemon:
                 c, _ = s.accept()
             except OSError:
                 return
+            self.touch(box.name)
             threading.Thread(target=self.preview_bridge, args=(box, c, gport), daemon=True).start()
 
     def preview_bridge(self, box, c, gport):
@@ -452,6 +493,7 @@ class Daemon:
         box = self.box(name)
         if not box.running():
             return send({"type": "error", "message": f"{name} is not running (sosa start {name})"})
+        self.touch(name)
         stack = self.stack_for(box)
         a = box.conf.get("agent") or stack.agent
         text = req.get("text")
@@ -746,6 +788,26 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 pass
         self.close_connection = True
 
+    def tunnel(self, box, b):
+        """After `HTTP/1.1 200 OK\r\n\r\n`, this connection is the box's port (front.py's way in)."""
+        d = self.d
+        ports = box.conf.get("ports") or []
+        if not ports:
+            return self.send_json(400, {"error": f"{box.name} has no app ports"})
+        port = int(b.get("port") or ports[0])
+        if port not in ports:
+            return self.send_json(400, {"error": f"{box.name}'s ports are {ports}"})
+        if not box.running():
+            if not b.get("wake", True) or box.conf.get("bake"):
+                return self.send_json(409, {"error": f"{box.name} is not running"})
+            d.log(f"{box.name}: waking for a tunnel to port {port}")
+            d.start(box.name)
+        d.touch(box.name)
+        self.wfile.write(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+        self.wfile.flush()
+        self.close_connection = True
+        d.preview_bridge(box, self.connection, port)
+
     def authorized(self):
         if self.api_token is None:
             return True
@@ -805,6 +867,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     return self.send_json(200, d.start(name))
                 if action == "stop" and method == "POST":
                     return self.send_json(200, d.stop(name, int(b.get("timeout") or 120)))
+                if action == "idle" and method == "POST":
+                    m = int(b.get("minutes") or 0)
+                    box.save_conf({k: v for k, v in {**box.conf, "idle": m}.items() if m or k != "idle"})
+                    d.touch(name)
+                    return self.send_json(200, {"name": name, "idle": m})
+                if action == "tunnel" and method == "POST":
+                    return self.tunnel(box, b)
                 if action == "turn" and method == "POST":
                     return self.stream(lambda send: d.turn(name, b, send))
                 if action == "cancel" and method == "POST":
@@ -815,6 +884,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     argv = b.get("argv")
                     if not isinstance(argv, list) or not argv:
                         return self.send_json(400, {"error": "exec needs argv"})
+                    d.touch(name)
                     return self.send_json(200, box.exec(argv, int(b.get("timeout") or 120), b.get("user"), b.get("cwd"),
                                                         b.get("stdin"), b.get("env")))
                 if action == "push" and method == "POST":

@@ -57,6 +57,12 @@ cat ~/.sosa/boxes/t1/egress.log                 # what the box tried to reach (R
 `busy`), `app` (`live.slot/port`, `healthy`, `good` rev), `preview` (`{"8080": "http://127.0.0.1:18000"}`),
 `egress` counts. `auth: None` means the box can't think: `sosa key` (relay) or `sosa token NAME`.
 
+## The front door
+
+`sosa front --zone example.com` serves `http://NAME.example.com/` for every box, waking one that is asleep.
+`sosa idle NAME 30` makes a box sleep after 30 untouched minutes; `sosa list` shows `asleep`. A request, a
+turn or `sosa start` wakes it. `http://example.com/_sosa/boxes` lists the routes.
+
 ## The API, for a backend
 
 Same verbs over HTTP: unix socket `~/.sosa/sosad.sock`, or `sosa daemon --tcp 127.0.0.1:8790` with

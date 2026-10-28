@@ -79,6 +79,20 @@ Only one daemon runs per home (a lock); the CLI starts it when it isn't up. The 
 `POST /v1/boxes/{name}/turn` streaming NDJSON (`facts`, `delta`, `tool`, `done` or `error`), and the preview
 ports to put behind your own proxy. Boxes that were up come back when the daemon restarts.
 
+## The front door
+
+`sosa front` is one address for every box: `http://NAME.ZONE/` is box NAME's app, `http://NAME-PORT.ZONE/` one
+of its other ports. A box that is asleep or down is started on the first request, which waits (about eight
+seconds from a baked image) instead of failing. A box with an idle timer (`sosa create --idle 30`, `sosa idle
+NAME 30`) is stopped and marked asleep after that many minutes without a turn, an exec or a request, so a host
+can hold far more boxes than it can run. The front door finds boxes on hosts: the local daemon by default, or a
+list of daemons in `~/.sosa/front.json`, each by its unix socket or TCP address and token. The preview rides
+inside the daemon's API (`POST /v1/boxes/NAME/tunnel`), so a host's preview ports never leave its loopback and
+one front door can stand in front of many hosts. Put your own login in front of it: with a `secret_file` in
+`front.json`, only requests carrying `X-Sosa-Front: <secret>` get in, and `X-Sosa-User` from your proxy is
+passed to the box's app. `GET http://ZONE/_sosa/boxes` lists what it routes. Details at the top of
+[sosa/front.py](sosa/front.py).
+
 ## Stacks
 
 Yours are private. This repo ships `stacks/hello` to prove the contract. `sosa stack init DIR` writes a

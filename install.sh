@@ -77,7 +77,23 @@ TimeoutStopSec=300
 [Install]
 WantedBy=default.target
 UNIT
+cat > "$HOME/.config/systemd/user/sosa-front.service" <<UNIT
+[Unit]
+Description=sosa front door: NAME.ZONE -> the box, woken on request
+After=sosad.service
+Wants=sosad.service
+
+[Service]
+Environment=SOSA_HOME=$HOME_DIR
+ExecStart=/usr/bin/python3 -I $REPO/sosa/front.py --home $HOME_DIR
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+UNIT
 systemctl --user daemon-reload
+echo "  installed ~/.config/systemd/user/sosa-front.service (optional: systemctl --user enable --now sosa-front; config in $HOME_DIR/front.json)"
 echo "  installed ~/.config/systemd/user/sosad.service (systemctl --user enable --now sosad; linger: $(loginctl show-user "$USER" -p Linger --value 2>/dev/null))"
 echo "  (without the unit, any sosa command starts sosad in the background)"
 
