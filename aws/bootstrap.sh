@@ -109,6 +109,8 @@ chmod 600 "$H/.sosa"/{anthropic-key,join-secret} 2>/dev/null || true
 step "stacks from s3://$BUCKET/stacks/"
 install -d -o $U -g $U "$H/stacks"
 as_u "aws s3 sync --quiet --delete s3://$BUCKET/stacks/ ~/stacks/ && ls ~/stacks" || echo "   (none, or no access)"
+# S3 keeps no mode bits: what the contract wants executable, is
+as_u 'find ~/stacks -type f \( -path "*/tools/*" -o -name bake.sh -o -name facts.sh \) -exec chmod +x {} +; true'
 as_u 'for d in ~/stacks/*/; do [ -f "$d/stack.toml" ] && sosa stack add "$d" | head -1; done; true'
 
 step "the daemon"

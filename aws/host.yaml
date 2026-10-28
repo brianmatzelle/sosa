@@ -191,6 +191,7 @@ Resources:
                   unzip -qo /tmp/awscli.zip -d /tmp && /tmp/aws/install --update
                 fi
                 # the user the daemon and the boxes run as; kvm for cloud-hypervisor
+                groupadd -f kvm
                 id sosa || useradd -m -s /bin/bash -G kvm sosa
               fi
               status "first boot: cloning"
