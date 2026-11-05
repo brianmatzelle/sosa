@@ -669,10 +669,13 @@ class Daemon:
             self.destroy(name)
         t0 = time.time()
         send({"line": f"bake {stack.name}: a fresh box from {os.path.basename(self.home.base_image)}"})
+        # from the plain image, not a previous bake: create() would otherwise
+        # start from the stack's last image, whose /srv/app already exists, so
+        # the first boot skips the seed copy and the bake proves stale files
+        # (benzo, 2026-11-05: check refused framework files the seed had changed)
         self.create({"name": name, "stack": sname, "mem": stack.box.get("bake_mem") or stack.box["mem"], "cpus": stack.box["cpus"],
-                     "disk": stack.box["disk"]})
-        box.save_conf({**box.conf, "bake": True, "image": self.home.base_image})
-        # from the plain image, not a previous bake
+                     "disk": stack.box["disk"], "image": self.home.base_image})
+        box.save_conf({**box.conf, "bake": True})
         box = self.box(name)
         try:
             self.start(name, wait=300)
