@@ -686,7 +686,11 @@ class Daemon:
                    "https_proxy=http://127.0.0.1:3128\\nNO_PROXY=localhost,127.0.0.1\\nno_proxy=localhost,127.0.0.1\\n' >> /etc/sosa/env")
             if stack.file("bake.sh"):
                 send({"line": "bake.sh"})
-                box.sh("rm -f /var/log/sosa-bake.rc; (cd /opt/sosa/stack && bash ./bake.sh > /var/log/sosa-bake.log 2>&1; "
+                # bash -c with the text, not bash FILE: bash reads a script file as it
+                # runs it, and under this wrapper the read position moved while the
+                # script's first apt-get ran, so bash resumed mid-comment ("line 11:
+                # with: command not found", benzo 2026-11-05). Read whole, nothing moves.
+                box.sh("rm -f /var/log/sosa-bake.rc; (cd /opt/sosa/stack && bash -c \"$(cat ./bake.sh)\" > /var/log/sosa-bake.log 2>&1; "
                        "echo $? > /var/log/sosa-bake.rc) >/dev/null 2>&1 &", 30)
                 seen = 0
                 rc = None
