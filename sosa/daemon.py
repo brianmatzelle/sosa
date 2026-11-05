@@ -112,6 +112,7 @@ class Daemon:
         self.mu = threading.Lock()
         self.relay_on = False
         self.harness = open(os.path.join(HERE, "harness.md")).read()
+        self.baking = {}            # bake box name -> t0 of the bake that owns it (the newest wins)
         self.advertise = f"unix://{os.path.join(home.path, 'sosad.sock')}"
         self.changed = threading.Event()   # a box came, went, started or stopped: tell the front door soon
         self.join_last = None
@@ -670,6 +671,10 @@ class Daemon:
         if box.exists():
             self.destroy(name)
         t0 = time.time()
+        # the newest bake of a stack wins: a second request destroys this one's box (above) and bakes from the
+        # stack as it is now; this one then fails, and the token lets it say so instead of a bare socket error
+        # (two agents on one host, 2026-11-05)
+        self.baking[name] = t0
         send({"line": f"bake {stack.name}: a fresh box from {os.path.basename(self.home.base_image)}"})
         # from the plain image, not a previous bake: create() would otherwise
         # start from the stack's last image, whose /srv/app already exists, so
@@ -749,8 +754,14 @@ class Daemon:
                 json.dump(manifest, f, indent=2)
             send({"line": f"image {out} ({manifest['bytes'] >> 20} MB on disk) in {manifest['seconds']} s"})
             self.destroy(name)
+            if self.baking.get(name) == t0:
+                del self.baking[name]
             return manifest
         except Exception:
+            if self.baking.get(name) != t0:
+                send({"line": f"superseded: a newer bake of {stack.name} started while this one ran and took its box; "
+                              "that one's result is the image"})
+                raise BoxError(f"superseded by a newer bake of {stack.name}") from None
             send({"line": f"the bake box {name} is left up to look at (sosa exec {name} ...; sosa destroy {name})"})
             raise
 
