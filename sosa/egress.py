@@ -7,7 +7,8 @@ host port 3128 (the guest's fwd.py relays 127.0.0.1:3128 there). An HTTP proxy t
   - plain absolute-form requests (GET http://host/...) to allowed hosts, which apt and the like need: only with
     --allow-plain (a bake), since the proxy then sees the request
 Anything else gets a 403 and a REFUSED line in the log, so you can see what else the box wanted. With --allow-all
-(a bake, which is your own stack downloading its toolchain) everything goes.
+(a bake, which is your own stack downloading its toolchain; or a stack whose [egress] allow is ["*"]) everything
+goes, still one ALLOWED line per connection.
 """
 import argparse
 import os

@@ -48,7 +48,8 @@ and bash; there is nothing to install beyond that.
 ## What a box is made of
 
 - **The wall.** No network interface. Claude reaches the box through the relay; the stack's allowed hosts (an
-  artifact mirror, a git host) through the egress proxy; nothing else does. The host reaches the box over vsock:
+  artifact mirror, a git host) through the egress proxy; nothing else does, unless the stack says
+  `allow = ["*"]` and opens the proxy to any host, each connection logged. The host reaches the box over vsock:
   the mind, the preview. The key is never in the box. Root in the box gets exactly the box.
 - **The mind** (`sosa/guest/mind.py`). `claude -p` with one conversation, resumed every turn, the system prompt
   rebuilt every turn (sosa's harness page, the stack's brief, the owner's prompt), the tools the stack allows,

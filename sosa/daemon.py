@@ -337,7 +337,9 @@ class Daemon:
                 self.close_previews(old)
             c = box.conf
             allow = stack.egress_allow()
-            ch, eg = box.launch(allow, allow_all=bool(c.get("bake")), allow_plain=bool(c.get("bake")))
+            # a bake downloads its own toolchain; a stack whose allow list is ["*"] has chosen the open web
+            everything = bool(c.get("bake")) or stack.egress_all()
+            ch, eg = box.launch(allow, allow_all=everything, allow_plain=everything)
             r = Running(ch, eg)
             self.running[name] = r
             threading.Thread(target=self.supervise, args=(name, r), daemon=True).start()

@@ -93,7 +93,12 @@ class Stack:
         return "".join(f"{k}={v}\n" for k, v in env.items())
 
     def egress_allow(self):
-        return ["api.anthropic.com:443"] + [str(x) for x in self.t["egress"]["allow"]]
+        return ["api.anthropic.com:443"] + [str(x) for x in self.t["egress"]["allow"] if str(x) != "*"]
+
+    def egress_all(self):
+        """True when [egress] allow holds "*": the box may reach any host, plain HTTP too, as a bake may.
+        The proxy still writes one line per connection, so the wall is gone but not the record."""
+        return any(str(x) == "*" for x in self.t["egress"]["allow"])
 
     # -- is it well formed
     def problems(self):
@@ -139,8 +144,8 @@ class Stack:
         if ag.get("effort") not in (None, "", "low", "medium", "high", "xhigh", "max"):
             p.append("[agent] effort must be low, medium, high, xhigh or max")
         for h in self.t["egress"]["allow"]:
-            if not re.fullmatch(r"(\*\.)?[A-Za-z0-9.-]+:\d{1,5}", str(h)):
-                p.append(f"[egress] allow: {h!r} must be host:port or *.domain:port")
+            if str(h) != "*" and not re.fullmatch(r"(\*\.)?[A-Za-z0-9.-]+:\d{1,5}", str(h)):
+                p.append(f"[egress] allow: {h!r} must be host:port, *.domain:port, or \"*\" for any host")
         for k in self.t["env"]:
             if not re.fullmatch(r"[A-Z_][A-Z0-9_]*", k):
                 p.append(f"[env] {k}: not a variable name")
@@ -154,7 +159,7 @@ class Stack:
         d = {"name": self.name, "description": self.description, "path": self.path,
              "files": sorted(n for n in os.listdir(self.path) if not n.startswith(".")),
              "has_app": self.has_app, "ports": self.app.get("ports"), "agent": self.agent, "box": self.box,
-             "egress": self.egress_allow(), "problems": self.problems()}
+             "egress": self.egress_allow(), "egress_all": self.egress_all(), "problems": self.problems()}
         td = self.file("tools")
         d["tools"] = sorted(os.listdir(td)) if td else []
         return d
@@ -189,7 +194,7 @@ health = "tools/health"   # exit 0 when the instance on $PORT is up
 ports = [8080]        # the first is the stable one; the rest pass straight through
 ready_s = 60
 
-[egress]              # hosts the box may reach, besides Claude: an artifact mirror, a git host
+[egress]              # hosts the box may reach, besides Claude: an artifact mirror, a git host; ["*"] = any host
 allow = []
 
 [env]                 # /etc/sosa/env, in the agent's and the tools' environment

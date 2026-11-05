@@ -54,6 +54,8 @@ SPRING_PROFILES_ACTIVE = "box"
 
 [egress]                             # hosts the box may CONNECT to, besides api.anthropic.com:443
 allow = ["repo.maven.apache.org:443", "registry.npmjs.org:443", "*.github.com:443"]
+# allow = ["*"]                      # or any host, plain HTTP too, each connection still logged: a stack
+                                     # that trusts its agent with the open web
 
 [env]                                # /etc/sosa/env: in the agent's, the tools' and the keeper's environment
 MAVEN_OPTS = "-Dmaven.repo.local=/srv/m2"
