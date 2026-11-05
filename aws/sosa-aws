@@ -134,7 +134,7 @@ case $cmd in
       [[ -f $d/stack.toml ]] || die "$d has no stack.toml"
       n=$(sed -n 's/^name *= *"\(.*\)"/\1/p' "$d/stack.toml" | head -1); n=${n:-$(basename "$(cd "$d" && pwd)")}
       echo "== $n -> s3://$b/stacks/$n/"
-      AWS s3 sync --quiet --delete --exclude '.git/*' --exclude '__pycache__/*' "$d" "s3://$b/stacks/$n/"
+      AWS s3 sync --quiet --delete --exclude '.git/*' --exclude '__pycache__/*' --exclude '*/__pycache__/*' --exclude '.venv/*' "$d" "s3://$b/stacks/$n/"
     done
     echo "uploaded. A new host pulls them at boot; a running one: aws/sosa-aws run HOST -- sudo aws/bootstrap.sh; the image: aws/sosa-aws image"
     ;;
