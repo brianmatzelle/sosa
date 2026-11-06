@@ -302,6 +302,9 @@ def proxy(port):
             c.sendall(f"HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n"
                       f"the live instance on {live['port']} isn't answering: {e}\n".encode())
             return c.close()
+        # the 5 s was for the connect only: left on, it cut every response that went quiet for 5 s (a long
+        # request, an event stream between events)
+        t.settimeout(None)
         th = threading.Thread(target=pump, args=(t, c), daemon=True)
         th.start()
         pump(c, t)
