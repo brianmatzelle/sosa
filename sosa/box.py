@@ -56,7 +56,11 @@ class Home:
         self.boxes = os.path.join(self.path, "boxes")
         self.arch, self.firmware = arch()
         self.base_image = os.path.join(self.images, f"noble-{self.arch}.raw")
-        self.claude = os.path.realpath(os.path.expanduser(os.environ.get("SOSA_CLAUDE") or "~/.local/bin/claude"))
+
+    @property
+    def claude(self):
+        # resolved on every use: Claude Code updates itself and prunes old versions under a long-running daemon
+        return os.path.realpath(os.path.expanduser(os.environ.get("SOSA_CLAUDE") or "~/.local/bin/claude"))
 
     def ensure(self):
         for d in (self.path, self.bin, self.images, self.stacks, self.boxes):
